@@ -42,10 +42,10 @@ import urllib.request, json
 try:
     with urllib.request.urlopen("http://127.0.0.1:8080/api/state", timeout=2) as r:
         d = json.loads(r.read().decode())
-        print(f"🟢 Phoenix Engine RUNNING at http://127.0.0.1:8080")
-        print(f"   Mode       : {d.get(\"regime_mode\")} (Auto-Ticking: {d.get(\"auto_running\")})")
-        print(f"   Bar Count  : #{d.get(\"tick_count\")} | BTC Price: ${d.get(\"latest_price\"):,.2f}")
-        print(f"   Net Profit : +${d.get(\"net_pnl_usd\"):,.2f} (+{d.get(\"net_pnl_bps\")} bps)")
+        print("🟢 Phoenix Engine RUNNING at http://127.0.0.1:8080")
+        print(f"   Mode       : {d.get('\''regime_mode'\'')} (Auto-Ticking: {d.get('\''auto_running'\'')})")
+        print(f"   Bar Count  : #{d.get('\''tick_count'\'')} | BTC Price: ${d.get('\''latest_price'\''):,.2f}")
+        print(f"   Net Profit : +${d.get('\''net_pnl_usd'\''):,.2f} (+{d.get('\''net_pnl_bps'\'')} bps)")
         logs = d.get("activity_log", [])
         if logs:
             print(f"   Latest Log : {logs[0]}")
