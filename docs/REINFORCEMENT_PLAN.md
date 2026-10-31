@@ -256,6 +256,13 @@ Data note: Hyperliquid's funding history settles every 8 hours in its early peri
 
 **Phase 3 gate**: cascade and tariff replays show lower drawdown than Phase 0 baseline; calm replay unchanged within 10% of trades; all breakers covered by tests.
 
+### Phase 3 implementation status (2026-10-31)
+
+| Task | Status | Where |
+|------|--------|-------|
+| P3.2 | Done. `risk/circuit_breakers.py`: per-sleeve soft limit (5% of the sleeve's allocation halves its entry size) and hard limit (7.5% disables it until `re_enable`), per-sleeve daily loss budget (3%, resets at the UTC day), per-pair StoplossGuard (3 stop-outs in 48 bars lock 24 bars), CooldownPeriod (4 bars after any exit) and LowProfit (last 20 trades net negative disables the pair), a Grossman-Zhou portfolio multiplier on a running maximum that decays 1% per day (20% maximum drawdown, EWMA-smoothed over 4 bars), and an operational lockdown (feed older than 30 s, reject storm, unknown position state) that blocks entries and asks for resting orders to be cancelled. Breakers only scale or refuse entries, never exits. On by default in live mode; replays and tests pass them explicitly (`run_replay(circuit_breakers=...)`). Every breaker has a unit test; a scripted stop storm shows cooldown, then the StoplossGuard lock, in that order; a calm replay shows no lockdowns. The `ChampionChallengerState` contract change listed in the plan was not needed: breaker state lives in the breaker book and is reported in the sleeve telemetry and on the dashboard. The cascade and tariff replays need the 2024 to 2025 backfill with open interest. | `risk/circuit_breakers.py`, `ui/api_server.py`, `research/replay.py` |
+| P3.1, P3.3, P3.4 | Not started. | |
+
 ---
 
 ## Phase 4: Execution (weeks 8 to 11)

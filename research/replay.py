@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.contracts import AssetMarketSnapshot, DataAvailability, DollarBar, MultiAssetMarketSnapshot
 from core.data_ingestion import ScriptedBarFeed, normalize_coin_symbol
+from risk.circuit_breakers import CircuitBreakers
 from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaSleeve
 from sleeves.sleeve_3_funding_carry import FundingCarrySleeve
 from ui.api_server import REAL_BAR_SOURCES, ControlCenterStateStore
@@ -137,6 +138,7 @@ class ReplayReport(BaseModel):
     equity_curve: list[EquityPoint]
     sleeve_attribution: dict[str, dict[str, Any]]
     data_availability: dict[str, Any]
+    breaker_events: list[str] = Field(default_factory=list)
     markouts_available: bool = False
     report_path: str | None = None
 
@@ -318,6 +320,7 @@ def run_replay(
     starting_capital_usd: float = 5_000.0,
     primary: str = "BTC",
     max_bars: int | None = None,
+    circuit_breakers: CircuitBreakers | None = None,
 ) -> ReplayReport:
     """Replay the scenario through the live tick and return (and optionally write) the report."""
     primary_live = data.live_by_coin.get(primary, [])
@@ -354,6 +357,7 @@ def run_replay(
             seed_bars=len(data.history_by_coin.get(primary, [])),
             hrp_seed_hours=len(data.hourly_closes_by_coin.get(primary, [])) or 1,
             fetch_derivatives_inputs=False,
+            circuit_breakers=circuit_breakers,
         )
         if starting_capital_usd != 5_000.0:
             store.reset_account(starting_capital_usd=starting_capital_usd)
@@ -419,6 +423,7 @@ def run_replay(
             equity_curve=curve,
             sleeve_attribution=attribution,
             data_availability=store.data_availability.model_dump(mode="json"),
+            breaker_events=(store.circuit_breakers.snapshot(None).events if store.circuit_breakers is not None else []),
         )
 
     if report_dir is not None:

@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from risk.circuit_breakers import (
+    BreakerSnapshot,
+    CircuitBreakerConfig,
+    CircuitBreakers,
+    EntryPermission,
+    OperationalStatus,
+)
 from risk.portfolio_allocator import (
     DEFAULT_CVAR_ALPHA,
     DEFAULT_GAMMA_KELLY,
@@ -22,6 +29,11 @@ from risk.portfolio_allocator import (
 )
 
 __all__ = [
+    "BreakerSnapshot",
+    "CircuitBreakerConfig",
+    "CircuitBreakers",
+    "EntryPermission",
+    "OperationalStatus",
     "DEFAULT_CVAR_ALPHA",
     "DEFAULT_GAMMA_KELLY",
     "DEFAULT_MAX_GROSS_LEVERAGE",

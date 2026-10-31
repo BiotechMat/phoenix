@@ -1977,7 +1977,12 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
             const bi = b.boundary_imbalance && b.boundary_imbalance.normalized ? b.boundary_imbalance.normalized['30'] : null;
             streamTxt = ` • BTC lead move (700 ms): ${{lead}} • Boundary imbalance (30 s): ${{bi === null || bi === undefined ? 'n/a' : Number(bi).toFixed(2)}}`;
           }}
-          sub.textContent = `Bar feed: ${{src}} • Stablecoin max peg deviation: ${{depeg}} • Deribit DVOL: ${{dvol}} • Hourly return rows: ${{state.data_availability ? state.data_availability.hourly_return_rows : 'n/a'}}${{streamTxt}}`;
+          let breakerTxt = '';
+          const cbs = state.sleeve_telemetry ? state.sleeve_telemetry.circuit_breakers : null;
+          if (cbs && cbs.portfolio_multiplier !== undefined) {{
+            breakerTxt = ` • Breakers: size x${{Number(cbs.portfolio_multiplier).toFixed(2)}}${{cbs.lockdown ? ' LOCKDOWN' : ''}}${{(cbs.disabled_sleeves || []).length ? ' disabled: ' + cbs.disabled_sleeves.join(', ') : ''}}`;
+          }}
+          sub.textContent = `Bar feed: ${{src}} • Stablecoin max peg deviation: ${{depeg}} • Deribit DVOL: ${{dvol}} • Hourly return rows: ${{state.data_availability ? state.data_availability.hourly_return_rows : 'n/a'}}${{streamTxt}}${{breakerTxt}}`;
         }}
       }}
 

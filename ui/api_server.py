@@ -97,6 +97,7 @@ from core.models import (
     compute_ewma_volatility,
     extract_continuous_and_binary_from_snapshots,
 )
+from risk.circuit_breakers import CircuitBreakers, OperationalStatus
 from risk.portfolio_allocator import HRPWeightScheduler, RollingHourlyReturnMatrix
 from sentiment.committee_models import (
     AdversarialRedTeamCritic,
@@ -369,6 +370,7 @@ class ControlCenterStateStore:
         aux_feed: HyperliquidAuxFeed | None = None,
         stream_hub: StreamHub | None = None,
         trend_sleeve: TrendSleeve | None = None,
+        circuit_breakers: CircuitBreakers | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
@@ -392,6 +394,9 @@ class ControlCenterStateStore:
         self._training_rows_with_oi: int = 0
         # Trend sleeve (P2.2): off unless a TrendSleeve with config.enabled=True is supplied.
         self._trend_sleeve: TrendSleeve = trend_sleeve or TrendSleeve()
+        # Circuit breakers (P3.2): on by default in live mode; replays and tests pass them explicitly.
+        self._breakers: CircuitBreakers | None = circuit_breakers or (CircuitBreakers() if fetch_derivatives_inputs else None)
+        self._blocked_entries: list[str] = []
         self._latest_trend_signals: dict[str, TrendSignal] = {}
         self._trend_eval_bucket: int | None = None
 
@@ -1027,6 +1032,14 @@ class ControlCenterStateStore:
                     for coin, venues in self._latest_aux.predicted_fundings.items()
                 },
             },
+            "circuit_breakers": (
+                {
+                    **self._breakers.snapshot(current_bar=len(self._history_bars) - 1).model_dump(mode="json"),
+                    "blocked_entries_last_bar": list(self._blocked_entries),
+                }
+                if self._breakers is not None
+                else {"enabled": False}
+            ),
             "hrp_weights": dict(self._latest_hrp_weights),
             "hrp_is_fallback": self._hrp_scheduler.last_result_is_fallback,
             "hourly_return_rows": self._hourly_returns.n_rows,
@@ -1179,6 +1192,19 @@ class ControlCenterStateStore:
                 "last_bar_flow": flow.model_dump(mode="json") if flow is not None else None,
             }
         return out
+
+    # ------------------------------------------------------------------ circuit breakers (P3.2)
+
+    def _operational_status(self, snap: MultiAssetMarketSnapshot) -> OperationalStatus:
+        """Feed age is measured against the wall clock only for the live candle feed (replays run in bar time)."""
+        age = 0.0
+        if isinstance(self._feed, HyperliquidCandleBarFeed) and snap.timestamp_ns > 0:
+            age = max(0.0, (datetime.now(timezone.utc).timestamp() * 1e9 - snap.timestamp_ns) / 1e9)
+        return OperationalStatus(feed_age_seconds=age, recent_rejects=0, position_state_known=True)
+
+    @property
+    def circuit_breakers(self) -> CircuitBreakers | None:
+        return self._breakers
 
     # ------------------------------------------------------------------ market context helpers
 
@@ -1833,14 +1859,34 @@ class ControlCenterStateStore:
             not regime_veto
             and s.regime_mode in (ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY, ExecutionRegimeMode.CARRY_ONLY_FALLBACK)
         )
-        cash_equity = self._starting_capital_usd + self._total_realized_pnl
+        cash_equity = self._starting_capital_usd + self._total_realized_pnl + sum(rec.net_pnl_usd for rec in closed)
+        self._blocked_entries = []
+        if self._breakers is not None:
+            for rec in closed:
+                self._breakers.record_closed_trade(rec, bar_index)
+            attribution = self._positions.sleeve_attribution(marks)
+            self._breakers.update_bar(
+                ts_ns=ts_close,
+                equity_usd=cash_equity + self._positions.total_unrealized_pnl_usd(marks),
+                sleeve_cum_pnl={sid: a.net_pnl_usd + a.unrealized_pnl_usd for sid, a in attribution.items()},
+                operational=self._operational_status(snap),
+            )
         if entries_allowed:
             for target in targets.values():
-                if target.weight == 0.0:
+                if target.weight == 0.0 or not self._positions.is_flat(target.sleeve_id, target.asset):
                     continue
                 m = marks.get(target.asset)
                 if m is None or m.bar is None:
                     continue
+                if self._breakers is not None:
+                    perm = self._breakers.permission(target.sleeve_id, target.asset, bar_index)
+                    if not perm.allowed:
+                        self._blocked_entries.append(f"{target.sleeve_id}:{target.asset}: {'; '.join(perm.reasons)}")
+                        continue
+                    if perm.size_multiplier < 1.0:
+                        target = target.model_copy(update={"weight": target.weight * perm.size_multiplier})
+                        if target.weight == 0.0:
+                            continue
                 pos = self._positions.open_position(
                     target,
                     equity_usd=cash_equity,
