@@ -1970,7 +1970,14 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
           const depeg = (mi.stablecoin_depeg_bps === null || mi.stablecoin_depeg_bps === undefined) ? 'n/a' : Number(mi.stablecoin_depeg_bps).toFixed(1) + ' bps';
           const dvol = (mi.dvol_index === null || mi.dvol_index === undefined) ? 'n/a' : Number(mi.dvol_index).toFixed(1) + ' (z ' + Number(mi.dvol_zscore || 0).toFixed(2) + ')';
           const src = state.data_availability ? state.data_availability.feed_source : 'n/a';
-          sub.textContent = `Bar feed: ${{src}} • Stablecoin max peg deviation: ${{depeg}} • Deribit DVOL: ${{dvol}} • Hourly return rows: ${{state.data_availability ? state.data_availability.hourly_return_rows : 'n/a'}}`;
+          let streamTxt = '';
+          if (state.streams && state.streams.enabled && state.streams.assets && state.streams.assets.BTC) {{
+            const b = state.streams.assets.BTC;
+            const lead = (b.lead_mid_change_bps_700ms === null || b.lead_mid_change_bps_700ms === undefined) ? 'n/a' : Number(b.lead_mid_change_bps_700ms).toFixed(2) + ' bps';
+            const bi = b.boundary_imbalance && b.boundary_imbalance.normalized ? b.boundary_imbalance.normalized['30'] : null;
+            streamTxt = ` • BTC lead move (700 ms): ${{lead}} • Boundary imbalance (30 s): ${{bi === null || bi === undefined ? 'n/a' : Number(bi).toFixed(2)}}`;
+          }}
+          sub.textContent = `Bar feed: ${{src}} • Stablecoin max peg deviation: ${{depeg}} • Deribit DVOL: ${{dvol}} • Hourly return rows: ${{state.data_availability ? state.data_availability.hourly_return_rows : 'n/a'}}${{streamTxt}}`;
         }}
       }}
 

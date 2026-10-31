@@ -134,3 +134,8 @@ Never rush directly into live capital. Follow this 5-step graduation protocol:
 ## Live feed availability panel
 
 The "Live Feed Availability" box lists every input the engine can use and whether a real feed is supplying it right now: candles, funding history, open-interest history, predicted fundings, open-interest caps, options surface, HLP vault, Deribit DVOL, stablecoin marks, taker flow, liquidations, trades and lead-venue mids. A grey pill means the feed is missing; the engine then treats that input as unknown (zero or ignored) and says so, rather than filling it with a guess. The line under the pills shows the current stablecoin peg deviation and DVOL that the macro sentinel is using.
+
+## Streams and feature checks
+
+- **Streams**: when the server runs it also listens to three websockets: Hyperliquid trades, Binance and Bybit top of book, and Bybit liquidations (with OKX as a backup for liquidations). Bars that close while these were connected carry real buyer/seller volume and real liquidation volume; otherwise those fields stay marked as unavailable. The availability panel shows the lead-venue price move over the last 0.7 seconds and the latest quarter-hour boundary imbalance.
+- **Feature checks**: `.venv/bin/python -m research.feature_eval` tests whether each input actually predicts anything on stored bars, against a pure-noise control, and records the result. A feature that cannot beat noise is not added to the model.

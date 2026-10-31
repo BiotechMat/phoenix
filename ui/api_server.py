@@ -88,6 +88,7 @@ from core.execution import (
     position_key,
 )
 from core.features import calibrate_optimal_d, compute_positioning_snapshots
+from core.streams import BarFlow, StreamHub
 from core.models import (
     EWMAVolatilityEstimator,
     FeeAdjustedTripleBarrierLabeler,
@@ -365,6 +366,7 @@ class ControlCenterStateStore:
         fetch_derivatives_inputs: bool = True,
         macro_feed: MacroInputsFeed | None = None,
         aux_feed: HyperliquidAuxFeed | None = None,
+        stream_hub: StreamHub | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
@@ -380,6 +382,12 @@ class ControlCenterStateStore:
         )
         self._latest_macro_inputs: MacroInputs = MacroInputs()
         self._latest_aux: HyperliquidAuxSnapshot = HyperliquidAuxSnapshot()
+        # Websocket streams (trades, liquidations, lead mids). Created for live mode, started by the app lifespan.
+        self._stream_hub: StreamHub | None = stream_hub or (
+            StreamHub(ASSETS, trades_dir=DATA_DIR / "trades") if fetch_derivatives_inputs else None
+        )
+        self._latest_bar_flows: dict[str, BarFlow] = {}
+        self._training_rows_with_oi: int = 0
 
         self._starting_capital_usd: float = 5_000.0
         self._base_capital_usd: float = 5_000.0
@@ -787,6 +795,7 @@ class ControlCenterStateStore:
     def _train_initial_ml_worker(self) -> None:
         """Train the initial worker from the Parquet store of real bars; otherwise run without a model."""
         training_bars = _load_training_bars_from_parquet(self._parquet_path)
+        self._training_rows_with_oi = len(training_bars)
         worker: LightGBMMetaLabelWorker | None = None
         try:
             worker = self._fit_worker_on_bars(training_bars)
@@ -1091,15 +1100,69 @@ class ControlCenterStateStore:
     def _availability_with_feeds(self, base: DataAvailability) -> DataAvailability:
         mi = self._latest_macro_inputs
         aux = self._latest_aux
-        return base.model_copy(
-            update={
-                "dvol": mi.dvol_available,
-                "stablecoin_marks": mi.stablecoin_marks_available,
-                "predicted_fundings": aux.predicted_fundings_available,
-                "oi_caps": aux.oi_caps_available,
-                "checked_at_ns": max(base.checked_at_ns, mi.ts_ns, aux.ts_ns),
+        update: dict[str, Any] = {
+            "dvol": mi.dvol_available,
+            "stablecoin_marks": mi.stablecoin_marks_available,
+            "predicted_fundings": aux.predicted_fundings_available,
+            "oi_caps": aux.oi_caps_available,
+            "checked_at_ns": max(base.checked_at_ns, mi.ts_ns, aux.ts_ns),
+            # Open-interest history is available when the training store holds enough real rows with OI
+            # (from a backfill or from bars recorded live), even though the candle feed has none.
+            "open_interest_history": base.open_interest_history or self._training_rows_with_oi >= MIN_TRAIN_LABELLED_BARS,
+        }
+        if self._stream_hub is not None:
+            btc_flow = self._latest_bar_flows.get("BTC")
+            avail = self._stream_hub.availability()
+            update["trades"] = avail.trades or (btc_flow is not None and btc_flow.taker_buy_usd is not None)
+            update["lead_mids"] = avail.lead_mids
+            update["taker_flow"] = btc_flow is not None and btc_flow.taker_buy_usd is not None
+            update["liquidations"] = btc_flow is not None and btc_flow.liquidation_usd is not None
+        return base.model_copy(update=update)
+
+    # ------------------------------------------------------------------ streams (P1.1, P1.3, P1.5)
+
+    @property
+    def stream_hub(self) -> StreamHub | None:
+        """Websocket hub feeding trades, liquidations and lead mids (None when streams are off)."""
+        return self._stream_hub
+
+    def _apply_stream_flows(self, bars_by_coin: Mapping[str, DollarBar]) -> dict[str, DollarBar]:
+        """Replace even-split taker volume and zero liquidations with stream values where the stream covered the bar."""
+        out = dict(bars_by_coin)
+        self._latest_bar_flows = {}
+        if self._stream_hub is None:
+            return out
+        for coin, bar in bars_by_coin.items():
+            flow = self._stream_hub.bar_flow(coin, bar.ts_open_ns // 1_000_000, bar.ts_close_ns // 1_000_000)
+            self._latest_bar_flows[coin] = flow
+            update: dict[str, float] = {}
+            if flow.taker_buy_usd is not None and flow.taker_sell_usd is not None:
+                update["buy_dollar_volume"] = flow.taker_buy_usd
+                update["sell_dollar_volume"] = flow.taker_sell_usd
+            if flow.liquidation_usd is not None:
+                update["liquidation_volume_usd"] = flow.liquidation_usd
+            if update:
+                out[coin] = bar.model_copy(update=update)
+        return out
+
+    @property
+    def stream_telemetry(self) -> dict[str, Any]:
+        """Latest stream-derived values: lead-mid moves, boundary imbalance, recent liquidations, bar flows."""
+        hub = self._stream_hub
+        if hub is None:
+            return {"enabled": False}
+        out: dict[str, Any] = {"enabled": True, "running": hub.running, "status": hub.status, "assets": {}}
+        for coin in ASSETS:
+            bi = hub.boundaries.latest(coin)
+            flow = self._latest_bar_flows.get(coin)
+            out["assets"][coin] = {
+                "lead_mid_change_bps_700ms": hub.lead_mids.lead_mid_change_bps(coin, 700),
+                "lead_venues": hub.lead_mids.venues(coin),
+                "boundary_imbalance": bi.model_dump(mode="json") if bi is not None else None,
+                "recent_liquidations": [e.model_dump(mode="json") for e in hub.liquidations.recent(coin, 5)],
+                "last_bar_flow": flow.model_dump(mode="json") if flow is not None else None,
             }
-        )
+        return out
 
     # ------------------------------------------------------------------ market context helpers
 
@@ -1595,6 +1658,7 @@ class ControlCenterStateStore:
 
     def _process_bar(self, bars_by_coin: Mapping[str, DollarBar], snap: MultiAssetMarketSnapshot) -> ControlActionResult:
         s = self._state
+        bars_by_coin = self._apply_stream_flows(bars_by_coin)
         new_bar = bars_by_coin["BTC"]
         feed_source = str(snap.feed_source)
         bar_source = self._bar_source_tag(snap)
@@ -2113,6 +2177,7 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
             "sleeve_targets": {k: t.model_dump(mode="json") for k, t in store.latest_targets.items()},
             "data_availability": store.data_availability.model_dump(mode="json"),
             "live_feeds": store.data_availability.live_feeds(),
+            "streams": store.stream_telemetry,
             "macro_inputs": store.latest_macro_inputs.model_dump(mode="json", exclude={"stablecoin_marks", "dvol"}),
             "sigma_bar_ewma96": store.sigma_bar,
         }
@@ -2135,11 +2200,16 @@ def create_app(store: ControlCenterStateStore | None = None) -> FastAPI:
                     except Exception as exc:
                         logger.error("Background tick failed: %s", exc)
 
+        hub = state_store.stream_hub
+        if hub is not None and not hub.running:
+            hub.start()
         task = asyncio.create_task(_background_ticker())
         try:
             yield
         finally:
             task.cancel()
+            if hub is not None:
+                hub.stop()
 
     app = FastAPI(
         title="Gemini Argon 4 — M1 Max Control Center API",

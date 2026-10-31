@@ -695,3 +695,24 @@ def test_phase0_gate_scripted_signals_produce_expected_trades_and_live_sleeve_pa
     assert panel["sleeve_attribution"][SLEEVE_DERIVATIVES]["closed_trades"] == 3
     assert panel["hrp_is_fallback"] is True  # no hourly history in this script: honest fallback
     assert panel["data_availability"]["liquidations"] is False
+
+
+def test_open_interest_history_flag_reflects_real_rows_in_the_training_store(tmp_path: Path) -> None:
+    history = sine_history("BTC", MIN_TRAIN_LABELLED_BARS + 40, 100.0)
+    store = build_store(
+        tmp_path,
+        live_bars={"BTC": flat_bars("BTC", 0, 1, 100.0)},
+        snapshots=[make_snapshot()],
+        history={"BTC": history},
+        availability=DataAvailability(candles=True, funding_history=True, open_interest_history=True, feed_source="SCRIPTED"),
+    )
+    assert store.data_availability.open_interest_history is True
+    empty = build_store(
+        tmp_path,
+        live_bars={"BTC": flat_bars("BTC", 0, 1, 100.0)},
+        snapshots=[make_snapshot()],
+        history={"BTC": flat_history("BTC", 64, 100.0)},
+        ledger_name="l2.json",
+        parquet_name="b2.parquet",
+    )
+    assert empty.data_availability.open_interest_history is False
