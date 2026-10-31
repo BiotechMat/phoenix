@@ -729,6 +729,12 @@ def test_web_ui_control_center_telegram_and_layman_docs() -> None:
         resp_ctrl = client.post(f"/api/control/{action}")
         assert resp_ctrl.status_code == 200
 
+    resp_reset = client.post("/api/reset", json={"starting_capital_usd": 25000.0})
+    assert resp_reset.status_code == 200
+    reset_json = resp_reset.json()
+    assert reset_json["starting_capital_usd"] == 25000.0
+    assert reset_json["net_pnl_usd"] == 0.0
+
     # Verify all 4 required layman documentation manuals exist and are populated
     docs_dir = Path(__file__).resolve().parent.parent / "docs"
     for doc_file in (

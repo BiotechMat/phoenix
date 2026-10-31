@@ -1311,9 +1311,16 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
   <!-- 4 SIMPLE, PLAIN-ENGLISH SUMMARY CARDS -->
   <div class="simple-kpi-grid">
     <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['net_of_fee_pnl'])}">
-      <div class="kpi-label">1. Live Paper Profit (On $100,000 Capital) (?)</div>
-      <div id="kpi-pnl-val" class="kpi-main" style="color: var(--green);">+${resolved.pnl_metrics.net_pnl_usd:,.2f}</div>
+      <div id="kpi-pnl-label" class="kpi-label">1. Live Paper Profit / Loss (On ${resolved.pnl_metrics.starting_capital_usd:,.0f} Capital) (?)</div>
+      <div id="kpi-pnl-val" class="kpi-main" style="color: {'var(--green)' if resolved.pnl_metrics.net_pnl_usd >= 0 else 'var(--red)'};">{'+' if resolved.pnl_metrics.net_pnl_usd >= 0 else ''}${resolved.pnl_metrics.net_pnl_usd:,.2f}</div>
       <div id="kpi-pnl-sub" class="kpi-sub">Account Equity: <strong>${resolved.pnl_metrics.current_equity_usd:,.2f}</strong> ({resolved.pnl_metrics.net_pnl_bps:+.1f} bps net of fees)</div>
+      <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px; align-items: center;">
+        <label for="starting-capital-input" style="font-size: 0.76rem; color: var(--muted); font-weight: 600;">Start Capital ($):</label>
+        <input id="starting-capital-input" type="number" min="100" step="1000" value="{int(resolved.pnl_metrics.starting_capital_usd)}" style="width: 105px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border); background: #0f172a; color: #fff; font-weight: 700; font-size: 0.82rem;" />
+        <button class="btn" style="background: #475569; padding: 5px 10px; font-size: 0.76rem; border-radius: 6px; opacity: 1;" onclick="resetCapital()" title="Clear accumulated profit back to $0.00 and set your custom paper starting capital">
+          🔄 Set Capital &amp; Clear Profit ($0)
+        </button>
+      </div>
     </div>
 
     <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['hrp_cvar_weights'])}">
@@ -1521,7 +1528,7 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
         pill.style.color = '#34d399';
         pill.style.borderColor = '#10b981';
         dot.style.background = '#10b981';
-        pillText.textContent = 'DRY-RUN RUNNING LIVE (Auto-Ticking Every 1.8s)';
+        pillText.textContent = 'DRY-RUN RUNNING LIVE (Auto-Ticking Every 4s)';
         tickBadge.textContent = '● Live Auto-Ticking';
         tickBadge.style.color = '#10b981';
       }} else if (action === 'pause_entries') {{
@@ -1573,12 +1580,20 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
         document.getElementById('live-btc-price').textContent = '$' + Number(state.latest_price).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
       }}
 
-      // Update KPI Card 1: PnL on $100,000 Paper Account
+      // Update KPI Card 1: PnL on custom Paper Account
       if (state.net_pnl_usd !== undefined) {{
-        const startCap = state.starting_capital_usd || 100000;
-        const equity = startCap + Number(state.net_pnl_usd);
-        const pnlSign = state.net_pnl_usd >= 0 ? '+' : '';
-        document.getElementById('kpi-pnl-val').textContent = pnlSign + '$' + Number(state.net_pnl_usd).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+        const startCap = Number(state.starting_capital_usd || 100000);
+        const netPnl = Number(state.net_pnl_usd);
+        const equity = startCap + netPnl;
+        const pnlSign = netPnl >= 0 ? '+' : '-';
+        const absPnl = Math.abs(netPnl);
+        const pnlEl = document.getElementById('kpi-pnl-val');
+        const lblEl = document.getElementById('kpi-pnl-label');
+        if (lblEl) {{
+          lblEl.textContent = '1. Live Paper Profit / Loss (On $' + startCap.toLocaleString(undefined, {{maximumFractionDigits: 0}}) + ' Capital) (?)';
+        }}
+        pnlEl.textContent = pnlSign + '$' + absPnl.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+        pnlEl.style.color = netPnl >= 0 ? 'var(--green)' : 'var(--red)';
         document.getElementById('kpi-pnl-sub').innerHTML =
           'Account Equity: <strong>$' + equity.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + '</strong> (' +
           (state.net_pnl_bps >= 0 ? '+' : '') + Number(state.net_pnl_bps).toFixed(1) + ' bps net | Saved $' +
@@ -1644,6 +1659,21 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       applyLiveStateToDOM(state, state.last_control_message);
     }}
 
+    async function resetCapital() {{
+      const inputEl = document.getElementById('starting-capital-input');
+      const rawVal = inputEl ? parseFloat(inputEl.value) : 100000;
+      const capUsd = (!isNaN(rawVal) && rawVal >= 100) ? rawVal : 100000;
+      const resp = await fetch('/api/reset', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ starting_capital_usd: capUsd }})
+      }});
+      const data = await resp.json();
+      if (data && data.live_state) {{
+        applyLiveStateToDOM(data.live_state, data.plain_english_explanation);
+      }}
+    }}
+
     async function sendControl(action) {{
       highlightActiveButton(action);
       const resp = await fetch('/api/control/' + action, {{ method: 'POST' }});
@@ -1651,19 +1681,10 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       if (data && data.live_state) {{
         applyLiveStateToDOM(data.live_state, data.plain_english_explanation);
       }}
-
-      if (dryRunTimer) {{
-        clearInterval(dryRunTimer);
-        dryRunTimer = null;
-      }}
-
-      if (action === 'start_dry_run' || action === 'switch_carry_only') {{
-        dryRunTimer = setInterval(stepSingleBar, 1800);
-      }}
     }}
 
-    // Start live auto-sync immediately on page load
-    dryRunTimer = setInterval(refreshFromServer, 2000);
+    // Poll server state every 2.5s (server advances bars every 4.0s when Dry-Run is active)
+    dryRunTimer = setInterval(refreshFromServer, 2500);
   </script>
 </body>
 </html>"""
