@@ -339,6 +339,8 @@ class HyperliquidWhaleVaultMetrics(BaseModel):
     net_delta_usd: float = 0.0
     hlp_crowding: Literal["CROWDED_LONG", "CROWDED_SHORT", "BALANCED"] = "BALANCED"
     timestamp_ns: int = 0
+    net_delta_by_coin_usd: dict[str, float] = Field(default_factory=dict, description="Signed position value at mark per coin")
+    accounts_read: int = Field(default=0, ge=0, description="Vault and child accounts whose positions were read")
 
 
 class FFDWeightsConfig(BaseModel):
@@ -788,6 +790,10 @@ class Position(BaseModel):
     bars_held: int = Field(default=0, ge=0)
     sigma_bar_at_entry: float = Field(default=0.0, ge=0.0)
     entry_reason: str = ""
+    exit_policy: Literal["triple_barrier", "target"] = Field(
+        default="triple_barrier",
+        description="'target' positions (trend, carry) have no price barriers and exit when the sleeve clears or flips",
+    )
 
     @property
     def profit_barrier(self) -> float | None:

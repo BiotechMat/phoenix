@@ -24,6 +24,7 @@ from data.backfill_storage import (  # noqa: E402
     DATA_DIR,
     Horizon,
     Venue,
+    refresh_funding,
     run_backfill,
 )
 
@@ -43,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--venues", default="bybit,okx", help="Candle/OI venue priority, comma separated")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--pause", type=float, default=0.12, help="Seconds between paged requests")
+    parser.add_argument("--no-mark-index", action="store_true", help="Fetch trade candles only (mark/spot fall back to close)")
+    parser.add_argument("--no-open-interest", action="store_true", help="Skip open-interest history")
+    parser.add_argument("--funding-only", action="store_true", help="Only re-fetch Hyperliquid funding into existing files")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -62,6 +66,13 @@ def main(argv: list[str] | None = None) -> int:
         if v in ("bybit", "okx"):
             venues.append(v)
 
+    if args.funding_only:
+        for coin in coins:
+            for h in horizons:
+                n = refresh_funding(coin, h, data_dir=args.data_dir, pause_sec=args.pause)
+                print(f"{coin}:{h} funding attached to {n} bars")
+        return 0
+
     reports = run_backfill(
         coins,
         horizons,
@@ -70,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
         data_dir=args.data_dir,
         venues=venues,
         pause_sec=args.pause,
+        include_mark_index=not args.no_mark_index,
+        include_open_interest=not args.no_open_interest,
     )
 
     ok = True

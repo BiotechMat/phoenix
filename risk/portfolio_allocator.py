@@ -328,8 +328,11 @@ class RollingHourlyReturnMatrix:
         self._asset_ids: tuple[str, ...] = tuple(str(a) for a in asset_ids)
         self._max_rows = max_rows
         self._rows: list[list[float]] = []
+        self._close_rows: list[list[float]] = []
         self._last_hour_bucket: int | None = None
         self._last_hourly_close: dict[str, float] = {}
+        self._completed_bucket: int | None = None
+        self._completed_close: dict[str, float] | None = None
 
     @property
     def asset_ids(self) -> tuple[str, ...]:
@@ -345,6 +348,10 @@ class RollingHourlyReturnMatrix:
     def last_hour_bucket(self) -> int | None:
         """Hour bucket (unix hours) of the most recent row, or None."""
         return self._last_hour_bucket
+
+    def closes_by_asset(self) -> dict[str, list[float]]:
+        """Completed hourly closes per asset, oldest first (up to ``max_rows + 1`` per asset)."""
+        return {a: [row[i] for row in self._close_rows] for i, a in enumerate(self._asset_ids)}
 
     def matrix(self) -> NDArray[np.float64]:
         """Return the (n_rows, n_assets) matrix of hourly log returns."""
@@ -366,6 +373,7 @@ class RollingHourlyReturnMatrix:
         if len(common) < 2:
             return self.n_rows
         self._rows = []
+        self._close_rows = [[per_asset[a][b] for a in self._asset_ids] for b in common][-(self._max_rows + 1) :]
         prev = common[0]
         for bucket in common[1:]:
             self._rows.append(
@@ -375,13 +383,17 @@ class RollingHourlyReturnMatrix:
         self._rows = self._rows[-self._max_rows :]
         self._last_hour_bucket = common[-1]
         self._last_hourly_close = {a: per_asset[a][common[-1]] for a in self._asset_ids}
+        self._completed_bucket = common[-1]
+        self._completed_close = dict(self._last_hourly_close)
         return self.n_rows
 
     def update(self, ts_ns: int, prices: Mapping[str, float]) -> bool:
-        """Observe live prices at ``ts_ns``; append one row when a new hour bucket completes.
+        """Observe live prices at ``ts_ns``; append one return row each time an hour completes.
 
-        Returns True when a row was appended. Prices for every asset in the universe must be
-        present and positive, otherwise the observation is ignored.
+        The last observation inside an hour is that hour's close. When the first observation of a later
+        hour arrives, the previous hour is complete and its return against the previous completed hour is
+        appended. Callers should pass a bar's close time minus 1 ns so a bar closing exactly on the hour
+        belongs to the hour it closes. Returns True when a return row was appended.
         """
         if any(a not in prices or float(prices[a]) <= 0.0 for a in self._asset_ids):
             return False
@@ -391,17 +403,27 @@ class RollingHourlyReturnMatrix:
             self._last_hourly_close = {a: float(prices[a]) for a in self._asset_ids}
             return False
         if bucket <= self._last_hour_bucket:
-            # Same hour: keep the latest close for this bucket, no new row yet.
             self._last_hourly_close = {a: float(prices[a]) for a in self._asset_ids}
             return False
-        # A later hour: the previous bucket's last close is final; the first observation of
-        # the new bucket closes nothing yet, so the row is formed from consecutive hourly closes.
-        prev_close = dict(self._last_hourly_close)
+        appended = self._complete_hour(self._last_hour_bucket, dict(self._last_hourly_close))
         self._last_hour_bucket = bucket
         self._last_hourly_close = {a: float(prices[a]) for a in self._asset_ids}
-        self._rows.append([math.log(self._last_hourly_close[a] / prev_close[a]) for a in self._asset_ids])
-        self._rows = self._rows[-self._max_rows :]
-        return True
+        return appended
+
+    def _complete_hour(self, bucket: int, closes: dict[str, float]) -> bool:
+        if self._completed_bucket is not None and bucket <= self._completed_bucket:
+            return False  # already recorded (e.g. the last seeded hour)
+        appended = False
+        if self._completed_close is not None:
+            prev = self._completed_close
+            self._rows.append([math.log(closes[a] / prev[a]) for a in self._asset_ids])
+            self._rows = self._rows[-self._max_rows :]
+            appended = True
+        self._close_rows.append([closes[a] for a in self._asset_ids])
+        self._close_rows = self._close_rows[-(self._max_rows + 1) :]
+        self._completed_bucket = bucket
+        self._completed_close = closes
+        return appended
 
 
 class HRPWeightScheduler:

@@ -26,6 +26,7 @@ import logging
 from pathlib import Path
 import time
 from typing import Any, Final, Literal
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -186,14 +187,25 @@ def _http_get_json(url: str, params: Mapping[str, Any], timeout_sec: float = DEF
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_post_json(url: str, payload: Mapping[str, Any], timeout_sec: float = DEFAULT_TIMEOUT_SEC) -> Any:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(dict(payload)).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "ProjectPhoenix/4.1"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _http_post_json(url: str, payload: Mapping[str, Any], timeout_sec: float = DEFAULT_TIMEOUT_SEC, max_retries: int = 6) -> Any:
+    """POST with exponential backoff on HTTP 429 (rate limited) and 5xx."""
+    delay = 2.0
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(dict(payload)).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "ProjectPhoenix/4.1"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if attempt >= max_retries or not (exc.code == 429 or exc.code >= 500):
+                raise
+            logger.info("HTTP %s from %s; retrying in %.0fs", exc.code, url, delay)
+            time.sleep(delay)
+            delay = min(delay * 2.0, 60.0)
+    raise RuntimeError("unreachable")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -283,9 +295,30 @@ def parse_okx_open_interest(rows: Sequence[Sequence[Any]]) -> list[tuple[int, fl
 
 
 def parse_hyperliquid_funding(rows: Sequence[Mapping[str, Any]]) -> list[tuple[int, float]]:
-    """Hyperliquid fundingHistory rows ``{"time", "fundingRate"}`` -> ``(t_ms, rate_1h)`` oldest first."""
+    """Hyperliquid fundingHistory rows ``{"time", "fundingRate"}`` -> ``(t_ms, rate_per_settlement)`` oldest first."""
     out = [(int(r["time"]), float(r["fundingRate"])) for r in rows if "time" in r and "fundingRate" in r]
     out.sort(key=lambda x: x[0])
+    return out
+
+
+def normalize_funding_to_hourly(series: Sequence[tuple[int, float]]) -> list[tuple[int, float]]:
+    """Convert each settlement's rate to a per-hour rate using the interval since the previous settlement.
+
+    Hyperliquid's early history settles every 8 hours (rates such as 0.0001 per 8 hours) and its later
+    history every hour (0.0000125 per hour for the same base rate), so the raw values are not comparable
+    without this step. The first settlement uses the interval to the next one.
+    """
+    pts = sorted(series)
+    out: list[tuple[int, float]] = []
+    for i, (t, rate) in enumerate(pts):
+        if i > 0:
+            gap_ms = t - pts[i - 1][0]
+        elif len(pts) > 1:
+            gap_ms = pts[1][0] - t
+        else:
+            gap_ms = 3_600_000
+        hours = max(1, int(round(gap_ms / 3_600_000)))
+        out.append((t, rate / float(hours)))
     return out
 
 
@@ -448,7 +481,7 @@ def fetch_hyperliquid_funding(
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     pause_sec: float = DEFAULT_PAUSE_SEC,
 ) -> list[tuple[int, float]]:
-    """Page Hyperliquid fundingHistory forwards in 500-row pages; ``(t_ms, rate_1h)`` oldest first."""
+    """Page Hyperliquid fundingHistory forwards in 500-row pages; ``(t_ms, rate_per_hour)`` oldest first."""
     rows: list[Mapping[str, Any]] = []
     cursor_start = int(start_ms)
     for _ in range(MAX_PAGES):
@@ -465,12 +498,12 @@ def fetch_hyperliquid_funding(
         if newest >= end_ms or len(page) < HYPERLIQUID_FUNDING_PAGE:
             break
         cursor_start = newest + 1
-        time.sleep(pause_sec)
+        time.sleep(max(pause_sec, 0.5))  # Hyperliquid rate-limits info requests by weight
     seen: dict[int, float] = {}
     for t, rate in parse_hyperliquid_funding(rows):
-        if start_ms <= t <= end_ms:
-            seen[t] = rate
-    return sorted(seen.items())
+        seen[t] = rate
+    hourly = normalize_funding_to_hourly(sorted(seen.items()))
+    return [(t, r) for t, r in hourly if start_ms <= t <= end_ms]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -681,8 +714,13 @@ def fetch_candle_bundle(
     venues: Sequence[Venue] = ("bybit", "okx"),
     pause_sec: float = DEFAULT_PAUSE_SEC,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+    include_mark_index: bool = True,
 ) -> tuple[list[Candle], list[tuple[int, float]], list[tuple[int, float]], str]:
-    """Candles plus mark and index closes from the first venue that answers; returns the venue used."""
+    """Candles plus mark and index closes from the first venue that answers; returns the venue used.
+
+    With ``include_mark_index=False`` only trade candles are fetched (mark and spot then fall back to the
+    close and are listed in ``fields_unavailable``).
+    """
     last_error: Exception | None = None
     for venue in venues:
         try:
@@ -691,6 +729,8 @@ def fetch_candle_bundle(
                 candles = parse_bybit_klines(fetch_bybit_klines(sym, horizon, start_ms, end_ms, pause_sec=pause_sec, timeout_sec=timeout_sec))
                 if not candles:
                     continue
+                if not include_mark_index:
+                    return candles, [], [], "bybit"
                 marks = parse_bybit_price_klines(fetch_bybit_klines(sym, horizon, start_ms, end_ms, kind="mark-price-kline", pause_sec=pause_sec, timeout_sec=timeout_sec))
                 index = parse_bybit_price_klines(fetch_bybit_klines(sym, horizon, start_ms, end_ms, kind="index-price-kline", pause_sec=pause_sec, timeout_sec=timeout_sec))
                 return candles, marks, index, "bybit"
@@ -698,6 +738,8 @@ def fetch_candle_bundle(
                 candles = parse_okx_candles(fetch_okx_candles(_okx_swap(coin), horizon, start_ms, end_ms, pause_sec=pause_sec, timeout_sec=timeout_sec))
                 if not candles:
                     continue
+                if not include_mark_index:
+                    return candles, [], [], "okx"
                 marks = parse_okx_price_candles(fetch_okx_candles(_okx_swap(coin), horizon, start_ms, end_ms, kind="history-mark-price-candles", pause_sec=pause_sec, timeout_sec=timeout_sec))
                 index = parse_okx_price_candles(fetch_okx_candles(_okx_index(coin), horizon, start_ms, end_ms, kind="history-index-candles", pause_sec=pause_sec, timeout_sec=timeout_sec))
                 return candles, marks, index, "okx"
@@ -744,9 +786,13 @@ def backfill_asset(
     pause_sec: float = DEFAULT_PAUSE_SEC,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     write: bool = True,
+    include_mark_index: bool = True,
+    include_open_interest: bool = True,
 ) -> tuple[pl.DataFrame, CoverageReport]:
     """Fetch, assemble, merge and report one asset at one horizon."""
-    candles, marks, index, candle_venue = fetch_candle_bundle(coin, horizon, start_ms, end_ms, venues=venues, pause_sec=pause_sec, timeout_sec=timeout_sec)
+    candles, marks, index, candle_venue = fetch_candle_bundle(
+        coin, horizon, start_ms, end_ms, venues=venues, pause_sec=pause_sec, timeout_sec=timeout_sec, include_mark_index=include_mark_index
+    )
     if not candles:
         empty = assemble_bars(coin, horizon, [])
         return empty, coverage_report(empty, coin, horizon)
@@ -755,7 +801,10 @@ def backfill_asset(
     except Exception as exc:
         logger.warning("Hyperliquid funding history failed for %s: %s", coin, exc)
         funding = []
-    oi_series, oi_venue = fetch_open_interest_bundle(coin, horizon, start_ms, end_ms, venues=venues, pause_sec=pause_sec, timeout_sec=timeout_sec)
+    oi_series: list[tuple[int, float]] = []
+    oi_venue = ""
+    if include_open_interest:
+        oi_series, oi_venue = fetch_open_interest_bundle(coin, horizon, start_ms, end_ms, venues=venues, pause_sec=pause_sec, timeout_sec=timeout_sec)
 
     df = assemble_bars(
         coin,
@@ -779,6 +828,31 @@ def backfill_asset(
     return df, report
 
 
+def refresh_funding(coin: str, horizon: Horizon, *, data_dir: Path = DATA_DIR, pause_sec: float = DEFAULT_PAUSE_SEC) -> int:
+    """Re-fetch Hyperliquid funding for an existing Parquet and rewrite its funding columns causally.
+
+    Returns the number of bars that now carry a funding settlement.
+    """
+    path = parquet_path_for(coin, horizon, data_dir)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    df = pl.read_parquet(path).sort("ts_open_ns")
+    t_open = (df.get_column("ts_open_ns").to_numpy() // 1_000_000).astype(np.int64)
+    funding = fetch_hyperliquid_funding(coin.upper(), int(t_open[0]) - 8 * 3_600_000, int(t_open[-1]), pause_sec=pause_sec)
+    f1h = _causal_values(funding, t_open, max_staleness_ms=None)
+    known = ~np.isnan(f1h)
+    f1h = np.where(known, f1h, 0.0)
+    unavailable = df.get_column("fields_unavailable").to_list() if "fields_unavailable" in df.columns else [""] * df.height
+    cleaned = [",".join(x for x in str(u).split(",") if x and x != "funding") + ("" if k else ",funding") for u, k in zip(unavailable, known)]
+    df = df.with_columns(
+        pl.Series("funding_rate_1h", f1h.tolist()),
+        pl.Series("funding_rate_8h", (f1h * 8.0).tolist()),
+        pl.Series("fields_unavailable", [c.strip(",") for c in cleaned]),
+    )
+    df.write_parquet(path)
+    return int(known.sum())
+
+
 def run_backfill(
     coins: Sequence[str] = ("BTC", "ETH", "SOL"),
     horizons: Sequence[Horizon] = ("15m", "1h"),
@@ -788,12 +862,17 @@ def run_backfill(
     data_dir: Path = DATA_DIR,
     venues: Sequence[Venue] = ("bybit", "okx"),
     pause_sec: float = DEFAULT_PAUSE_SEC,
+    include_mark_index: bool = True,
+    include_open_interest: bool = True,
 ) -> dict[str, CoverageReport]:
     """Backfill every coin and horizon; returns coverage reports keyed ``COIN:horizon``."""
     reports: dict[str, CoverageReport] = {}
     for coin in coins:
         for horizon in horizons:
-            _, report = backfill_asset(coin, horizon, start_ms, end_ms, data_dir=data_dir, venues=venues, pause_sec=pause_sec)
+            _, report = backfill_asset(
+                coin, horizon, start_ms, end_ms, data_dir=data_dir, venues=venues, pause_sec=pause_sec,
+                include_mark_index=include_mark_index, include_open_interest=include_open_interest,
+            )
             reports[f"{coin.upper()}:{horizon}"] = report
     return reports
 
@@ -829,6 +908,8 @@ __all__ = [
     "parse_okx_candles",
     "parse_okx_open_interest",
     "parse_okx_price_candles",
+    "normalize_funding_to_hourly",
     "perp_instrument_id",
+    "refresh_funding",
     "run_backfill",
 ]

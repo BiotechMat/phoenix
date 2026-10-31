@@ -139,3 +139,8 @@ The "Live Feed Availability" box lists every input the engine can use and whethe
 
 - **Streams**: when the server runs it also listens to three websockets: Hyperliquid trades, Binance and Bybit top of book, and Bybit liquidations (with OKX as a backup for liquidations). Bars that close while these were connected carry real buyer/seller volume and real liquidation volume; otherwise those fields stay marked as unavailable. The availability panel shows the lead-venue price move over the last 0.7 seconds and the latest quarter-hour boundary imbalance.
 - **Feature checks**: `.venv/bin/python -m research.feature_eval` tests whether each input actually predicts anything on stored bars, against a pure-noise control, and records the result. A feature that cannot beat noise is not added to the model.
+
+## Sleeves that are off by default
+
+- **Trend (Sleeve 2)** is built and tested but switched off. On 3.4 years of real hourly data it made money overall and in two of three crisis windows, but its average profit per trade is below the 15 bps the promotion gate requires. `python -m research.trend_eval` re-runs that check on your data.
+- **Derivatives alpha (Sleeve 1)** now measures option skew and dealer gamma correctly and reads the HLP vault's real positions. Its trading rule has not been validated on the corrected numbers, so the dashboard shows its signal marked "SHADOW_NOT_VALIDATED" and it does not open positions.

@@ -111,6 +111,7 @@ from sentiment.committee_models import (
     RiskCommitteeOutput,
 )
 from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaSignal, DerivativesAlphaSleeve
+from sleeves.sleeve_2_trend import TREND_SLEEVE_ID, TrendSignal, TrendSleeve
 from sleeves.sleeve_3_funding_carry import (
     CarryDirection,
     CarryOpportunityEvaluation,
@@ -367,6 +368,7 @@ class ControlCenterStateStore:
         macro_feed: MacroInputsFeed | None = None,
         aux_feed: HyperliquidAuxFeed | None = None,
         stream_hub: StreamHub | None = None,
+        trend_sleeve: TrendSleeve | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
@@ -388,6 +390,10 @@ class ControlCenterStateStore:
         )
         self._latest_bar_flows: dict[str, BarFlow] = {}
         self._training_rows_with_oi: int = 0
+        # Trend sleeve (P2.2): off unless a TrendSleeve with config.enabled=True is supplied.
+        self._trend_sleeve: TrendSleeve = trend_sleeve or TrendSleeve()
+        self._latest_trend_signals: dict[str, TrendSignal] = {}
+        self._trend_eval_bucket: int | None = None
 
         self._starting_capital_usd: float = 5_000.0
         self._base_capital_usd: float = 5_000.0
@@ -453,10 +459,11 @@ class ControlCenterStateStore:
         self._sigma_estimator: EWMAVolatilityEstimator = EWMAVolatilityEstimator.from_bars(self._history_bars, span=96)
 
         # Hourly HRP-CVaR risk budgets from real 1h returns (equal weights until 96 rows exist).
-        self._hourly_returns = RollingHourlyReturnMatrix(ASSETS, max_rows=720)
+        trend_hours = self._trend_sleeve.config.min_history_hours + 24 if self._trend_sleeve.enabled else 0
+        self._hourly_returns = RollingHourlyReturnMatrix(ASSETS, max_rows=max(720, trend_hours + 48))
         self._hrp_scheduler = HRPWeightScheduler(ASSETS)
         try:
-            hourly = {coin: self._feed.hourly_closes(coin, hrp_seed_hours) for coin in ASSETS}
+            hourly = {coin: self._feed.hourly_closes(coin, max(hrp_seed_hours, trend_hours)) for coin in ASSETS}
             self._hourly_returns.seed_from_hourly_closes(hourly)
         except Exception as exc:
             logger.warning("Hourly return seed failed (%s); HRP will fall back to equal weights.", exc)
@@ -974,14 +981,23 @@ class ControlCenterStateStore:
                 "p_meta": btc_deriv.p_meta if btc_deriv is not None else 0.5,
                 "expected_gross_edge_bps": btc_deriv.expected_gross_edge_bps if btc_deriv is not None else 0.0,
                 "open_positions": len(open_deriv),
+                "allocating": self._derivatives_alpha_sleeve.config.allocate,
                 "status": (
-                    "ALPHA_SIGNALS_ONLINE"
+                    ("ALPHA_SIGNALS_ONLINE" if self._derivatives_alpha_sleeve.config.allocate else "SHADOW_NOT_VALIDATED")
                     if self._data_availability.options_surface or self._data_availability.hlp_vault
                     else "INPUTS_UNAVAILABLE"
                 ),
                 "signals": {
                     coin: sig.model_dump(mode="json") for coin, sig in self._latest_derivatives_signals.items()
                 },
+            },
+            "trend": {
+                "sleeve_id": TREND_SLEEVE_ID,
+                "enabled": self._trend_sleeve.enabled,
+                "hourly_closes_held": min((len(v) for v in self._hourly_returns.closes_by_asset().values()), default=0),
+                "history_required_hours": self._trend_sleeve.config.min_history_hours,
+                "signals": {coin: sig.model_dump(mode="json") for coin, sig in self._latest_trend_signals.items()},
+                "open_positions": len([p for p in self._positions.open_positions.values() if p.sleeve_id == TREND_SLEEVE_ID]),
             },
             "meta_labeller": {
                 "sleeve_id": SLEEVE_META_LABELLER,
@@ -1242,7 +1258,30 @@ class ControlCenterStateStore:
                     logger.debug("HLP vault fetch failed: %s", exc)
                 self._derivatives_inputs_cache["__vault__"] = (ts_ns, None, vault)
         self._derivatives_inputs_cache[coin] = (ts_ns, surface, vault)
+        if surface is not None and surface.dvol_annualized > 0.0:
+            self._record_surface(coin, surface, ts_ns)
         return surface, vault
+
+    def _record_surface(self, coin: str, surface: DeribitOptionsSurface, ts_ns: int) -> None:
+        """Append the surface components to ``data/options_surface/{coin}.parquet`` for later IC evaluation (P2.4)."""
+        if not self._fetch_derivatives_inputs:
+            return
+        try:
+            path = DATA_DIR / "options_surface" / f"{coin.lower()}.parquet"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            row = pl.DataFrame(
+                {
+                    "ts_ns": [ts_ns],
+                    "rr25_30d": [surface.skew_25d],
+                    "term_structure_slope": [surface.term_structure_slope],
+                    "net_gex_usd_per_1pct": [surface.net_gex_usd],
+                    "atm_iv_near": [surface.dvol_annualized],
+                }
+            )
+            combined = pl.concat([pl.read_parquet(path), row], how="diagonal_relaxed") if path.exists() else row
+            combined.write_parquet(path)
+        except Exception as exc:
+            logger.debug("Surface history append failed: %s", exc)
 
     def _evaluate_sleeves(
         self,
@@ -1273,10 +1312,10 @@ class ControlCenterStateStore:
             carry_signals[coin] = self._funding_carry_sleeve.generate_sleeve_signal(carry_eval)
 
             surface, vault = self._derivatives_inputs(coin, ts_ns)
-            if surface is not None and (surface.skew_25d != 0.0 or surface.net_gex_usd != 0.0 or surface.term_structure_slope != 0.0):
-                surface_seen = True
-            if vault is not None and (vault.net_delta_usd != 0.0 or vault.hlp_crowding != "BALANCED"):
-                vault_seen = True
+            if surface is not None and surface.dvol_annualized > 0.0:
+                surface_seen = True  # a priced surface was read (ATM IV present)
+            if vault is not None and vault.accounts_read > 0:
+                vault_seen = True  # vault positions were read, even if HLP is flat
             deriv_signals[coin] = self._derivatives_alpha_sleeve.generate_alpha_signal(
                 options_surface=surface,
                 vault_metrics=vault,
@@ -1346,6 +1385,7 @@ class ControlCenterStateStore:
                 epistemic_gate_passed=True,
             )
             for coin, sig in self._latest_derivatives_signals.items()
+            if self._derivatives_alpha_sleeve.config.allocate
         ]
         carry_inputs = [
             AssetAllocationInput(
@@ -1412,6 +1452,27 @@ class ControlCenterStateStore:
                     p_meta=carry_sig.meta_probability,
                     expected_gross_return_bps=carry_sig.raw_expected_return,
                     reason=ev.reason if ev is not None else "carry evaluation unavailable",
+                )
+
+        # Trend sleeve: continuous inverse-vol weights, re-evaluated once per completed hour.
+        if self._trend_sleeve.enabled:
+            bucket = self._hourly_returns.n_rows
+            if self._trend_eval_bucket != bucket:
+                self._latest_trend_signals = self._trend_sleeve.evaluate(self._hourly_returns.closes_by_asset())
+                self._trend_eval_bucket = bucket
+            for coin, tsig in self._latest_trend_signals.items():
+                targets[position_key(TREND_SLEEVE_ID, coin)] = SleeveTarget(
+                    sleeve_id=TREND_SLEEVE_ID,
+                    asset=coin,
+                    weight=tsig.target_weight * directional_m,
+                    hedged=False,
+                    exit_policy="target",
+                    p_meta=min(1.0, 0.5 + 0.5 * abs(tsig.forecast)),
+                    reason=(
+                        f"trend forecast {tsig.forecast:+.2f} "
+                        f"({', '.join(f'{lb}h {v:+.2f}' for lb, v in tsig.forecast_by_lookback.items())}), "
+                        f"vol {tsig.vol_annual:.0%}, corr adj {tsig.corr_adjustment:.2f}"
+                    ),
                 )
 
         # Global gross leverage cap across sleeves (hedged carry counts both legs).
@@ -1679,7 +1740,7 @@ class ControlCenterStateStore:
             coin: (bars_by_coin[coin].close if coin in bars_by_coin else (a.mid_price if (a := snap.get_asset(coin)) is not None else 0.0))
             for coin in ASSETS
         }
-        self._hourly_returns.update(ts_close, hourly_prices)
+        self._hourly_returns.update(ts_close - 1, hourly_prices)  # a bar closing on the hour belongs to that hour
         self._latest_hrp_weights = self._hrp_scheduler.compute(ts_close, self._hourly_returns.matrix())
         feed_avail = self._feed.availability
         self._data_availability = self._availability_with_feeds(

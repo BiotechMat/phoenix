@@ -24,3 +24,6 @@ quant-engine/
 
 # Replay reports
 data/replays/
+data/options_surface/
+data/trades/
+data/trial_registry.jsonl

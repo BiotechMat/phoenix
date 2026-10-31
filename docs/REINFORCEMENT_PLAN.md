@@ -215,6 +215,16 @@ Sandbox note: the Bybit paths are exercised on recorded fixtures only, because B
 
 **Phase 2 gate**: at least one of P2.1 to P2.4 passes CPCV and is enabled in shadow mode (P5.1); the others are either passing, in progress, or recorded as failed trials.
 
+### Phase 2 implementation status (2026-10-31)
+
+| Task | Status | Where |
+|------|--------|-------|
+| P2.2 | Implemented and evaluated; **does not pass the CPCV gate, ships off**. `sleeves/sleeve_2_trend.py` computes tanh(return / realised vol) over 24h, 168h and 720h, equal-weighted, sized by inverse 25-day EWMA vol with the 1/sqrt(1 + (N-1)ρ̄) adjustment, a per-asset cap and a 5% rebalance buffer; positions use a new "target" exit policy (no price barriers, exit when the sleeve clears or flips). `research/trend_eval.py` validated it on 3.4 years of real hourly bars (June 2023 to October 2026, OKX candles, Hyperliquid funding) net of maker fees, slippage and funding: portfolio return +20.2%, Sharpe 1.25, max drawdown 4.3%, positive in 2 of the 3 crisis windows (carry unwind +0.63%, tariff +0.16%, October 2025 cascade −0.15%). Per asset it fails the gate mainly on E[net PnL per trade] > 15 bps (BTC 1.7, ETH 4.9, SOL 14.3 bps) and on DSR for BTC (0.89) and SOL (0.88); three trials logged. The correlation with the derivatives sleeve cannot be measured because that sleeve's history cannot be reconstructed. Parameters were not tuned to pass. | `sleeves/sleeve_2_trend.py`, `research/trend_eval.py` |
+| P2.4 | Computation fixed; **validation pending data, sleeve does not allocate**. `core/options_surface.py` computes Black-Scholes delta and gamma from Deribit mark IV per instrument (agrees with Deribit's own greeks to about 0.002 delta), the 25-delta risk reversal at 30 and 90 days, ATM term structure from real expiry timestamps, and dealer GEX per 1% move from gamma × OI. The previous parser averaged call minus put IV across all strikes and split near/far by response order. HLP positioning is now read from the vault's child accounts at mark value, per coin (the parent vault holds no positions, so the old reading was always empty). Surface components are appended to `data/options_surface/{coin}.parquet` each fetch so their ICs can be evaluated with P1.8 once history accrues; Deribit's public API has no historical surface. Because the corrected skew is usually negative in crypto, the unchanged ±1.5 vol-point rule would short BTC most of the time; `DerivativesAlphaConfig.allocate` (default off) keeps the sleeve evaluating and reporting without sizing until it is validated. Taker-flow-per-strike GEX and the OTM taker imbalance need Deribit trades and are not done. | `core/options_surface.py`, `sleeves/sleeve_1_derivatives_alpha.py` |
+| P2.1, P2.3 | Not started. | |
+
+Data note: Hyperliquid's funding history settles every 8 hours in its early period (for example 0.0001 per 8 hours in June 2023) and every hour later (0.0000125 per hour). The backfill now divides each settlement by its interval, so stored `funding_rate_1h` is a true hourly rate throughout; earlier backfills should be refreshed with `scripts/backfill.py --funding-only`. The hourly return matrix used by HRP was also corrected to form returns from completed-hour closes; it previously used the first price of the new hour.
+
 ---
 
 ## Phase 3: Allocation, risk and regimes (weeks 6 to 9)

@@ -218,17 +218,35 @@ def test_p0_3_fewer_than_96_rows_falls_back_to_equal_weights_with_warning(caplog
     assert any("fallback to equal weights" in rec.message for rec in caplog.records)
 
 
-def test_p0_3_rolling_hourly_matrix_appends_once_per_hour() -> None:
+def test_p0_3_rolling_hourly_matrix_appends_once_per_completed_hour() -> None:
     m = RollingHourlyReturnMatrix(("BTC", "ETH", "SOL"), max_rows=10)
     hour = 3_600_000_000_000
     assert m.update(0, {"BTC": 100.0, "ETH": 10.0, "SOL": 5.0}) is False
-    assert m.update(hour // 2, {"BTC": 101.0, "ETH": 10.0, "SOL": 5.0}) is False  # same hour, no row
-    assert m.update(hour + 1, {"BTC": 102.0, "ETH": 9.0, "SOL": 5.5}) is True
+    assert m.update(hour // 2, {"BTC": 101.0, "ETH": 10.0, "SOL": 5.0}) is False  # hour 0 close becomes 101
+    assert m.update(hour + 1, {"BTC": 102.0, "ETH": 9.0, "SOL": 5.5}) is False  # hour 0 complete: first close, no return yet
+    assert m.update(hour + hour // 2, {"BTC": 103.0, "ETH": 9.5, "SOL": 5.5}) is False  # hour 1 close becomes 103
+    assert m.update(2 * hour + 1, {"BTC": 104.0, "ETH": 9.0, "SOL": 5.0}) is True  # hour 1 complete
     assert m.n_rows == 1
     row = m.matrix()[0]
-    assert row[0] == pytest.approx(math.log(102.0 / 101.0))
-    assert row[1] == pytest.approx(math.log(9.0 / 10.0))
-    assert m.update(2 * hour + 1, {"BTC": 102.0}) is False  # incomplete universe ignored
+    assert row[0] == pytest.approx(math.log(103.0 / 101.0))  # completed-hour closes, not a partial hour
+    assert row[1] == pytest.approx(math.log(9.5 / 10.0))
+    assert m.closes_by_asset()["BTC"] == [101.0, 103.0]
+    assert m.update(3 * hour + 1, {"BTC": 102.0}) is False  # incomplete universe ignored
+
+
+def test_p0_3_seeded_matrix_does_not_duplicate_the_last_seeded_hour() -> None:
+    hour_ms = 3_600_000
+    m = RollingHourlyReturnMatrix(("BTC", "ETH"), max_rows=10)
+    m.seed_from_hourly_closes({"BTC": [(0, 100.0), (hour_ms, 101.0)], "ETH": [(0, 10.0), (hour_ms, 10.1)]})
+    assert m.n_rows == 1 and m.closes_by_asset()["BTC"] == [100.0, 101.0]
+    h_ns = hour_ms * 1_000_000
+    # Bars of hour 2 (the hour after the last seeded one), then the first bar of hour 3 completes hour 2.
+    assert m.update(2 * h_ns + 900_000_000_000 - 1, {"BTC": 101.5, "ETH": 10.1}) is False
+    assert m.update(3 * h_ns - 1, {"BTC": 102.0, "ETH": 10.2}) is False
+    assert m.update(3 * h_ns + 900_000_000_000 - 1, {"BTC": 103.0, "ETH": 10.3}) is True
+    assert m.n_rows == 2
+    assert m.matrix()[-1][0] == pytest.approx(math.log(102.0 / 101.0))
+    assert m.closes_by_asset()["BTC"] == [100.0, 101.0, 102.0]
 
 
 def test_p0_3_store_uses_real_hrp_from_hourly_history(tmp_path: Path) -> None:
@@ -716,3 +734,25 @@ def test_open_interest_history_flag_reflects_real_rows_in_the_training_store(tmp
         parquet_name="b2.parquet",
     )
     assert empty.data_availability.open_interest_history is False
+
+
+def test_unvalidated_derivatives_sleeve_reports_but_does_not_allocate(tmp_path: Path) -> None:
+    from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaConfig
+
+    class _BearishUnvalidated(ForcedSignalDerivativesSleeve):
+        def __init__(self) -> None:
+            super().__init__(asset="BTC", direction=-1, p_meta=0.8, edge_bps=60.0)
+            self.config = DerivativesAlphaConfig(allocate=False)
+
+    store = build_store(
+        tmp_path,
+        live_bars={"BTC": flat_bars("BTC", 0, 1, 100.0), **companion_flat_bars(1)},
+        snapshots=[make_snapshot()],
+        history={"BTC": flat_history("BTC", 64, 100.0)},
+        derivatives_sleeve=_BearishUnvalidated(),
+    )
+    store.step_simulation_tick()
+    assert store.sleeve_telemetry["derivatives_alpha"]["primary_direction"] == -1  # evaluated and reported
+    assert store.sleeve_telemetry["derivatives_alpha"]["allocating"] is False
+    assert not any(k.startswith(f"{SLEEVE_DERIVATIVES}:") and t.weight != 0.0 for k, t in store.latest_targets.items())
+    assert store.position_manager.open_positions == {}

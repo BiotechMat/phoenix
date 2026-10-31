@@ -19,7 +19,7 @@ from core.contracts import (
     MultiAssetMarketSnapshot,
 )
 from core.data_ingestion import ScriptedBarFeed
-from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaSignal, DerivativesAlphaSleeve
+from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaConfig, DerivativesAlphaSignal, DerivativesAlphaSleeve
 from sleeves.sleeve_3_funding_carry import FundingCarrySleeve
 from ui.api_server import ControlCenterStateStore
 
@@ -161,7 +161,8 @@ class ForcedSignalDerivativesSleeve(DerivativesAlphaSleeve):
     """Derivatives sleeve stub that emits a fixed directional signal for one asset and never fetches."""
 
     def __init__(self, asset: str = "BTC", direction: int = 1, p_meta: float = 0.80, edge_bps: float = 60.0) -> None:
-        super().__init__()
+        # The forced stub stands in for a validated sleeve, so it is allowed to allocate.
+        super().__init__(DerivativesAlphaConfig(allocate=True))
         self._asset = asset
         self._direction = direction
         self._p = p_meta

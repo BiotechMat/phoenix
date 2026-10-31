@@ -27,6 +27,7 @@ from core.contracts import (
     HyperliquidWhaleVaultMetrics,
     compute_fractional_kelly,
 )
+from core.options_surface import SurfaceMetrics, compute_surface_metrics, instrument_specs_from_names
 from sleeves.sleeve_3_funding_carry import (
     ALO_ROUTING_TAG,
     SleeveSignalOutput,
@@ -73,6 +74,14 @@ class DerivativesAlphaConfig(BaseModel):
         default=120.0, description="Ceiling on gross return edge in bps"
     )
     request_timeout_sec: float = Field(default=1.0, gt=0.0)
+    allocate: bool = Field(
+        default=False,
+        description=(
+            "Whether the live loop may size positions from this sleeve. Off until the composite passes the "
+            "P2.4 validation (component ICs and an out-of-fold win over the best single component); the sleeve "
+            "still evaluates and reports while off."
+        ),
+    )
 
 
 class DerivativesAlphaSignal(BaseModel):
@@ -138,6 +147,7 @@ class DerivativesAlphaSleeve:
         self.config: DerivativesAlphaConfig = config or DerivativesAlphaConfig()
         self._cached_surface: dict[str, DeribitOptionsSurface] = {}
         self._cached_vault: HyperliquidWhaleVaultMetrics | None = None
+        self._last_surface_metrics: dict[str, SurfaceMetrics] = {}
 
     async def fetch_deribit_options_surface(
         self,
@@ -198,104 +208,65 @@ class DerivativesAlphaSleeve:
         book_summary: list[dict[str, Any]],
         now_ns: int,
     ) -> DeribitOptionsSurface:
-        """Parse raw Deribit book summary into skew, term structure slope, and net GEX."""
+        """Surface metrics from per-instrument marks (REINFORCEMENT_PLAN P2.4).
+
+        ``skew_25d`` is the 30-day 25-delta risk reversal in decimal vol (call IV minus put IV / 100),
+        ``term_structure_slope`` is (ATM IV at ~90d - ATM IV at ~7d) / ATM IV at ~7d, ``net_gex_usd`` is the
+        dealer gamma exposure per 1% move (calls minus puts), and ``dvol_annualized`` carries the near ATM IV.
+        """
         if not book_summary:
             return DeribitOptionsSurface(currency=currency, timestamp_ns=now_ns)
-
-        calls_oi_gamma = 0.0
-        puts_oi_gamma = 0.0
-        call_ivs: list[float] = []
-        put_ivs: list[float] = []
-        near_ivs: list[float] = []
-        far_ivs: list[float] = []
-
-        for item in book_summary:
-            inst_name = str(item.get("instrument_name", ""))
-            oi = float(item.get("open_interest", 0.0))
-            mid_iv = float(item.get("mid_iv", item.get("mark_iv", 0.0)))
-            underlying_px = float(item.get("underlying_price", 0.0))
-
-            if mid_iv > 0.0:
-                if inst_name.endswith("-C"):
-                    call_ivs.append(mid_iv)
-                    # Gamma proxy proportional to OI / spot
-                    calls_oi_gamma += oi * mid_iv * (underlying_px * 0.01)
-                elif inst_name.endswith("-P"):
-                    put_ivs.append(mid_iv)
-                    puts_oi_gamma += oi * mid_iv * (underlying_px * 0.01)
-
-            # Approximate term structure by expiry label length/ordering
-            if len(near_ivs) < 20 and mid_iv > 0.0:
-                near_ivs.append(mid_iv)
-            elif mid_iv > 0.0:
-                far_ivs.append(mid_iv)
-
-        avg_call_iv = (sum(call_ivs) / len(call_ivs)) if call_ivs else 50.0
-        avg_put_iv = (sum(put_ivs) / len(put_ivs)) if put_ivs else 50.0
-
-        # 25-delta skew proxy: (Call IV - Put IV) / baseline IV
-        skew_25d = (avg_call_iv - avg_put_iv) / 100.0
-
-        # Term structure slope: (Far IV - Near IV) / Near IV
-        avg_near = (sum(near_ivs) / len(near_ivs)) if near_ivs else 50.0
-        avg_far = (sum(far_ivs) / len(far_ivs)) if far_ivs else avg_near
-        ts_slope = (avg_far - avg_near) / max(avg_near, 1.0)
-
-        # Net GEX in USD: Calls Gamma USD - Puts Gamma USD
-        net_gex_usd = calls_oi_gamma - puts_oi_gamma
-
+        now_ms = now_ns // 1_000_000
+        metrics = compute_surface_metrics(book_summary, instrument_specs_from_names(book_summary), now_ms, currency=currency)
+        self._last_surface_metrics[currency] = metrics
         return DeribitOptionsSurface(
             currency=currency,
-            skew_25d=round(skew_25d, 4),
-            term_structure_slope=round(ts_slope, 4),
-            net_gex_usd=round(net_gex_usd, 2),
-            dvol_annualized=round(avg_near, 2),
+            skew_25d=round((metrics.rr25_30d or 0.0) / 100.0, 6),
+            term_structure_slope=round(metrics.term_structure_slope or 0.0, 6),
+            net_gex_usd=round(metrics.net_gex_usd_per_1pct, 2),
+            dvol_annualized=round(metrics.atm_iv_near or 0.0, 4),
             timestamp_ns=now_ns,
         )
+
+    @property
+    def last_surface_metrics(self) -> dict[str, SurfaceMetrics]:
+        """Full surface metrics from the latest fetch per currency."""
+        return dict(self._last_surface_metrics)
 
     async def fetch_hyperliquid_vault_positioning(
         self,
         vault_address: str | None = None,
     ) -> HyperliquidWhaleVaultMetrics:
-        """Fetch HLP vault positioning from Hyperliquid L1 info API or fallback gracefully."""
-        v_addr = vault_address or self.config.vault_address
-        now_ns = time.time_ns()
+        """Async wrapper around ``fetch_hyperliquid_vault_positioning_sync``."""
+        import asyncio
 
-        try:
-            async with httpx.AsyncClient(timeout=self.config.request_timeout_sec) as client:
-                payload = {"type": "vaultDetails", "vaultAddress": v_addr}
-                resp = await client.post(HYPERLIQUID_INFO_URL, json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    metrics = self._parse_hlp_vault_details(v_addr, data, now_ns)
-                    self._cached_vault = metrics
-                    return metrics
-        except Exception as e:
-            logger.debug("Hyperliquid vaultDetails fetch failed (%s); using fallback.", e)
-
-        if self._cached_vault is not None:
-            return self._cached_vault
-        return HyperliquidWhaleVaultMetrics(vault_address=v_addr, timestamp_ns=now_ns)
+        return await asyncio.to_thread(self.fetch_hyperliquid_vault_positioning_sync, vault_address)
 
     def fetch_hyperliquid_vault_positioning_sync(
         self,
         vault_address: str | None = None,
     ) -> HyperliquidWhaleVaultMetrics:
-        """Synchronous wrapper for fetch_hyperliquid_vault_positioning."""
+        """Read HLP positions: the vault's ``clearinghouseState`` plus every child account's.
+
+        HLP is a parent vault whose positions sit in child sub-accounts listed under
+        ``vaultDetails.relationship.data.childAddresses``; the parent's own state holds none.
+        """
         v_addr = vault_address or self.config.vault_address
         now_ns = time.time_ns()
-
         try:
-            with httpx.Client(timeout=self.config.request_timeout_sec) as client:
-                payload = {"type": "vaultDetails", "vaultAddress": v_addr}
-                resp = client.post(HYPERLIQUID_INFO_URL, json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    metrics = self._parse_hlp_vault_details(v_addr, data, now_ns)
-                    self._cached_vault = metrics
-                    return metrics
+            with httpx.Client(timeout=self.config.request_timeout_sec * 3) as client:
+                details = client.post(HYPERLIQUID_INFO_URL, json={"type": "vaultDetails", "vaultAddress": v_addr}).json()
+                accounts = [v_addr] + list(((details or {}).get("relationship") or {}).get("data", {}).get("childAddresses", []) or [])
+                states: dict[str, dict[str, Any]] = {}
+                for acct in accounts:
+                    resp = client.post(HYPERLIQUID_INFO_URL, json={"type": "clearinghouseState", "user": acct})
+                    if resp.status_code == 200 and isinstance(resp.json(), dict):
+                        states[acct] = resp.json()
+            metrics = self._parse_hlp_vault_details(v_addr, {"details": details, "states": states}, now_ns)
+            self._cached_vault = metrics
+            return metrics
         except Exception as e:
-            logger.debug("Hyperliquid vault sync fetch failed (%s); using fallback.", e)
+            logger.debug("Hyperliquid vault positions fetch failed (%s); using cached/empty.", e)
 
         if self._cached_vault is not None:
             return self._cached_vault
@@ -307,37 +278,42 @@ class DerivativesAlphaSleeve:
         data: dict[str, Any],
         now_ns: int,
     ) -> HyperliquidWhaleVaultMetrics:
-        """Parse Hyperliquid vaultDetails response into TVL, net delta, and retail crowding."""
-        portfolio = data.get("portfolio", {})
-        tvl_usd = float(data.get("summary", {}).get("tvl", portfolio.get("accountValue", 120_000_000.0)))
-
-        # Sum position deltas in USD across all active perps held by HLP
-        net_delta_usd = 0.0
-        positions = portfolio.get("positions", [])
-        if isinstance(positions, list):
-            for p in positions:
-                if isinstance(p, dict):
-                    pos_info = p.get("position", {})
-                    szi = float(pos_info.get("szi", 0.0))
-                    px = float(pos_info.get("entryPx", 0.0))
-                    net_delta_usd += szi * px
-
+        """Sum signed position value at mark per coin across the vault and its child accounts."""
+        states: dict[str, Any] = data.get("states", {}) or {}
+        by_coin: dict[str, float] = {}
+        tvl = 0.0
+        for state in states.values():
+            if not isinstance(state, dict):
+                continue
+            try:
+                tvl += float((state.get("marginSummary") or {}).get("accountValue", 0.0))
+            except (TypeError, ValueError):
+                pass
+            for ap in state.get("assetPositions", []) or []:
+                pos = ap.get("position", {}) if isinstance(ap, dict) else {}
+                try:
+                    szi = float(pos.get("szi", 0.0))
+                    value = float(pos.get("positionValue", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                coin = str(pos.get("coin", "")).upper()
+                if not coin or szi == 0.0:
+                    continue
+                by_coin[coin] = by_coin.get(coin, 0.0) + math.copysign(value, szi)
+        net_delta = sum(by_coin.values())
         thresh = self.config.hlp_crowding_notional_usd
-        if net_delta_usd < -thresh:
-            # HLP is net short -> Retail is crowded long
-            crowding: Literal["CROWDED_LONG", "CROWDED_SHORT", "BALANCED"] = "CROWDED_SHORT"
-        elif net_delta_usd > thresh:
-            # HLP is net long -> Retail is crowded short
-            crowding = "CROWDED_LONG"
-        else:
-            crowding = "BALANCED"
-
+        # HLP is the counterparty: HLP net short means retail is crowded long, and vice versa.
+        crowding: Literal["CROWDED_LONG", "CROWDED_SHORT", "BALANCED"] = (
+            "CROWDED_SHORT" if net_delta < -thresh else ("CROWDED_LONG" if net_delta > thresh else "BALANCED")
+        )
         return HyperliquidWhaleVaultMetrics(
             vault_address=vault_address,
-            tvl_usd=tvl_usd,
-            net_delta_usd=net_delta_usd,
+            tvl_usd=tvl,
+            net_delta_usd=net_delta,
             hlp_crowding=crowding,
             timestamp_ns=now_ns,
+            net_delta_by_coin_usd=by_coin,
+            accounts_read=len(states),
         )
 
     def generate_alpha_signal(
@@ -377,7 +353,7 @@ class DerivativesAlphaSleeve:
         )
         vault_is_empty = (
             vault is None
-            or (vault.net_delta_usd == 0.0 and vault.hlp_crowding == "BALANCED")
+            or (vault.net_delta_usd == 0.0 and vault.hlp_crowding == "BALANCED" and not vault.net_delta_by_coin_usd)
         )
 
         if surface_is_empty and vault_is_empty:
@@ -398,7 +374,11 @@ class DerivativesAlphaSleeve:
         resolved_skew = surf.skew_25d if surf is not None else 0.0
         resolved_ts = surf.term_structure_slope if surf is not None else 0.0
         resolved_gex = surf.net_gex_usd if surf is not None else 0.0
-        resolved_crowd = vault.hlp_crowding if vault is not None else "BALANCED"
+        resolved_crowd: Literal["CROWDED_LONG", "CROWDED_SHORT", "BALANCED"] = vault.hlp_crowding if vault is not None else "BALANCED"
+        if vault is not None and clean_id in vault.net_delta_by_coin_usd:
+            coin_delta = vault.net_delta_by_coin_usd[clean_id]
+            thresh = self.config.hlp_crowding_notional_usd
+            resolved_crowd = "CROWDED_SHORT" if coin_delta < -thresh else ("CROWDED_LONG" if coin_delta > thresh else "BALANCED")
 
         # 1. 25-Delta Skew Signal (Call skew > 0 is bullish, Put skew < 0 is bearish)
         skew_score = 0.0

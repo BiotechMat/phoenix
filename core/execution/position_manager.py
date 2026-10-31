@@ -58,6 +58,7 @@ class SleeveTarget(BaseModel):
     asset: str
     weight: float = Field(description="Signed fraction of equity; for hedged carry the per-leg weight (> 0)")
     hedged: bool = False
+    exit_policy: Literal["triple_barrier", "target"] = "triple_barrier"
     p_meta: float = Field(default=0.5, ge=0.0, le=1.0)
     expected_gross_return_bps: float = 0.0
     reason: str = ""
@@ -246,7 +247,8 @@ class PositionManager:
         upper: float | None = None
         lower: float | None = None
         vertical: int | None = None
-        if not target.hedged:
+        uses_barriers = not target.hedged and target.exit_policy == "triple_barrier"
+        if uses_barriers:
             ub, lb = compute_effective_barriers(max(sigma_bar, 0.0), self._barrier_cfg)
             if side > 0:
                 upper = price * (1.0 + ub)
@@ -279,6 +281,7 @@ class PositionManager:
             entry_fee_usd=entry_fee,
             sigma_bar_at_entry=max(sigma_bar, 0.0),
             entry_reason=target.reason,
+            exit_policy="target" if (target.hedged or target.exit_policy == "target") else "triple_barrier",
         )
         self._open[target.key] = position
         logger.info(
@@ -344,7 +347,7 @@ class PositionManager:
             if regime_veto:
                 exit_reason = PositionExitReason.REGIME_VETO
                 exit_price = m.close
-            elif not pos.hedged:
+            elif not pos.hedged and pos.exit_policy == "triple_barrier":
                 profit_px = pos.profit_barrier
                 stop_px = pos.stop_barrier
                 hit_profit = False
@@ -371,10 +374,11 @@ class PositionManager:
                         exit_reason = PositionExitReason.TARGET_FLIPPED
                         exit_price = m.close
             else:
+                # Target-managed positions (hedged carry, trend): exit when the sleeve clears or flips.
                 tgt = targets.get(key)
                 if tgt is None or tgt.weight == 0.0:
                     exit_reason = PositionExitReason.TARGET_CLEARED
-                elif not tgt.hedged:
+                elif tgt.hedged != pos.hedged or (not pos.hedged and tgt.side != pos.side):
                     exit_reason = PositionExitReason.TARGET_FLIPPED
                 exit_price = m.close
 
