@@ -33,6 +33,7 @@ import urllib.request
 import numpy as np
 import polars as pl
 import pyarrow as pa
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("phoenix.data.backfill")
 
@@ -506,6 +507,76 @@ def fetch_hyperliquid_funding(
     return [(t, r) for t, r in hourly if start_ms <= t <= end_ms]
 
 
+class FundingSettlement(BaseModel):
+    """One Hyperliquid funding settlement with its premium and the interval it covers."""
+
+    model_config = ConfigDict(frozen=True)
+
+    t_ms: int
+    rate_per_hour: float
+    premium: float
+    interval_hours: int
+
+
+def fetch_hyperliquid_settlements(
+    coin: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    url: str = HYPERLIQUID_INFO_URL,
+    timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+    pause_sec: float = 0.5,
+) -> list[FundingSettlement]:
+    """Full fundingHistory with premium, normalised to per-hour rates by settlement interval."""
+    rows: list[Mapping[str, Any]] = []
+    cursor_start = int(start_ms)
+    for _ in range(MAX_PAGES):
+        data = _http_post_json(url, {"type": "fundingHistory", "coin": coin, "startTime": cursor_start, "endTime": int(end_ms)}, timeout_sec=timeout_sec)
+        page = [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+        if not page:
+            break
+        rows.extend(page)
+        newest = max(int(r["time"]) for r in page)
+        if newest >= end_ms or len(page) < HYPERLIQUID_FUNDING_PAGE:
+            break
+        cursor_start = newest + 1
+        time.sleep(max(pause_sec, 0.5))
+    by_t: dict[int, tuple[float, float]] = {}
+    for r in rows:
+        try:
+            by_t[int(r["time"])] = (float(r["fundingRate"]), float(r.get("premium", 0.0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    ts = sorted(by_t)
+    out: list[FundingSettlement] = []
+    for i, t in enumerate(ts):
+        gap = (t - ts[i - 1]) if i > 0 else ((ts[1] - t) if len(ts) > 1 else 3_600_000)
+        hours = max(1, int(round(gap / 3_600_000)))
+        rate, prem = by_t[t]
+        out.append(FundingSettlement(t_ms=t, rate_per_hour=rate / hours, premium=prem, interval_hours=hours))
+    return [x for x in out if start_ms <= x.t_ms <= end_ms]
+
+
+def save_settlements(settlements: Sequence[FundingSettlement], path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pl.DataFrame(
+        {
+            "t_ms": [s.t_ms for s in settlements],
+            "rate_per_hour": [s.rate_per_hour for s in settlements],
+            "premium": [s.premium for s in settlements],
+            "interval_hours": [s.interval_hours for s in settlements],
+        },
+        schema={"t_ms": pl.Int64, "rate_per_hour": pl.Float64, "premium": pl.Float64, "interval_hours": pl.Int64},
+    )
+    df.write_parquet(path)
+    return df.height
+
+
+def load_settlements(path: Path) -> list[FundingSettlement]:
+    df = pl.read_parquet(path).sort("t_ms")
+    return [FundingSettlement(**row) for row in df.iter_rows(named=True)]
+
+
 # ------------------------------------------------------------------------------------------------
 # Assembly, merge, coverage
 # ------------------------------------------------------------------------------------------------
@@ -893,7 +964,11 @@ __all__ = [
     "backfill_asset",
     "coverage_report",
     "fetch_bybit_klines",
+    "FundingSettlement",
     "fetch_bybit_open_interest",
+    "fetch_hyperliquid_settlements",
+    "load_settlements",
+    "save_settlements",
     "fetch_candle_bundle",
     "fetch_hyperliquid_funding",
     "fetch_okx_candles",

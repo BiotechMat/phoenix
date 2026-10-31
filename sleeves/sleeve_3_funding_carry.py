@@ -786,3 +786,84 @@ __all__ = [
     "FundingCarrySleeve",
     "SleeveSignalOutput",
 ]
+
+
+# ================================================================================================
+# Carry v2: deviation-from-no-arbitrage rule (REINFORCEMENT_PLAN P2.1)
+# ================================================================================================
+
+
+class CarryV2Config(BaseModel):
+    """Parameters of the deviation-from-no-arbitrage carry rule (He, Manela, Ross, von Wachter).
+
+    ``kappa`` is the number of premium payments per year. Hyperliquid pays one-eighth of an 8-hour
+    premium every hour, so the premium is paid at 3 x 365 = 1095 periods per year (the plan's 8760 would
+    treat the hourly payment as the full premium and understate the fair premium eightfold).
+    ``interest_annual`` is Hyperliquid's fixed interest component (0.01% per 8 hours).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kappa: float = Field(default=1095.0, gt=0.0)
+    interest_annual: float = Field(default=0.0001 * 1095.0)
+    roundtrip_cost: float = Field(default=0.00075, ge=0.0, description="Both legs, in and out, as a fraction of notional")
+    trailing_hours: int = Field(default=72, ge=1)
+    min_instant_funding_per_hour: float = Field(default=-0.01 / 24.0, description="Hard exit below -1% per day")
+    crowded_funding_annual: float = Field(default=0.25, gt=0.0)
+    crowded_size: float = Field(default=0.5, gt=0.0, le=1.0)
+
+    @property
+    def upper_band(self) -> float:
+        return self.kappa * math.log(1.0 + self.roundtrip_cost)
+
+
+def compute_deviation_rho(premium: float, config: CarryV2Config | None = None) -> float:
+    """Annualised deviation of the perp from its no-arbitrage level: rho = kappa * premium - (r - r')."""
+    cfg = config or CarryV2Config()
+    return cfg.kappa * premium - cfg.interest_annual
+
+
+class CarryV2Decision(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    size: float = Field(ge=0.0, le=1.0)
+    rho: float
+    trailing_funding_per_hour: float
+    action: Literal["ENTER", "EXIT", "HOLD", "FLAT"]
+    reason: str
+
+
+def carry_v2_decide(
+    *,
+    in_position: bool,
+    premium: float,
+    funding_per_hour: float,
+    trailing_funding_per_hour: float,
+    oi_cap_hit: bool = False,
+    config: CarryV2Config | None = None,
+) -> CarryV2Decision:
+    """One step of the v2 state machine for a spot-long / perp-short carry.
+
+    Entry: rho above the cost band and positive trailing (3-day) funding. Exit: rho at or below zero,
+    trailing funding negative, or instantaneous funding below -1% per day. Crowding (annualised funding
+    above 25%, or the asset at its OI cap) halves the size. The plan's extra "rho < 0 for 6 hours" exit
+    is implied by the first exit rule.
+    """
+    cfg = config or CarryV2Config()
+    rho = compute_deviation_rho(premium, cfg)
+    crowded = funding_per_hour * 8760.0 > cfg.crowded_funding_annual or oi_cap_hit
+    size = cfg.crowded_size if crowded else 1.0
+    if in_position:
+        if rho <= 0.0:
+            return CarryV2Decision(size=0.0, rho=rho, trailing_funding_per_hour=trailing_funding_per_hour, action="EXIT", reason=f"rho {rho:+.4f} crossed zero")
+        if trailing_funding_per_hour < 0.0:
+            return CarryV2Decision(size=0.0, rho=rho, trailing_funding_per_hour=trailing_funding_per_hour, action="EXIT", reason="3-day mean funding negative")
+        if funding_per_hour < cfg.min_instant_funding_per_hour:
+            return CarryV2Decision(size=0.0, rho=rho, trailing_funding_per_hour=trailing_funding_per_hour, action="EXIT", reason="funding below -1% per day")
+        return CarryV2Decision(size=size, rho=rho, trailing_funding_per_hour=trailing_funding_per_hour, action="HOLD", reason="rho positive" + (", crowded: half size" if crowded else ""))
+    if rho > cfg.upper_band and trailing_funding_per_hour > 0.0 and funding_per_hour >= cfg.min_instant_funding_per_hour:
+        return CarryV2Decision(size=size, rho=rho, trailing_funding_per_hour=trailing_funding_per_hour, action="ENTER", reason=f"rho {rho:+.4f} above band {cfg.upper_band:.4f}" + (", crowded: half size" if crowded else ""))
+    return CarryV2Decision(size=0.0, rho=rho, trailing_funding_per_hour=trailing_funding_per_hour, action="FLAT", reason="inside the no-arbitrage band")
+
+
+__all__ += ["CarryV2Config", "CarryV2Decision", "carry_v2_decide", "compute_deviation_rho"]
