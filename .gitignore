@@ -1,6 +1,7 @@
 # Virtual environments & caches
 .venv/
 logs/
+data/*.parquet
 __pycache__/
 *.py[cod]
 *$py.class
