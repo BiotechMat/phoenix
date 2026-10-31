@@ -69,6 +69,16 @@ from core.contracts import (
     compute_signed_target_weights,
 )
 from core.data_ingestion import BarFeed, HyperliquidCandleBarFeed, normalize_coin_symbol
+from core.market_feeds import (
+    HyperliquidAuxFeed,
+    HyperliquidAuxSnapshot,
+    LiveHyperliquidAuxFeed,
+    LiveMacroInputsFeed,
+    MacroInputs,
+    MacroInputsFeed,
+    ScriptedHyperliquidAuxFeed,
+    ScriptedMacroInputsFeed,
+)
 from core.execution import (
     BarMarks,
     PositionManager,
@@ -353,12 +363,23 @@ class ControlCenterStateStore:
         seed_bars: int = HISTORY_SEED_BARS,
         hrp_seed_hours: int = HRP_SEED_HOURS,
         fetch_derivatives_inputs: bool = True,
+        macro_feed: MacroInputsFeed | None = None,
+        aux_feed: HyperliquidAuxFeed | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
         self._fee: FeeSchedule = fee_schedule or FeeSchedule.hyperliquid()
         self._barrier_cfg: TripleBarrierConfig = TripleBarrierConfig(fee_schedule=self._fee)
         self._fetch_derivatives_inputs: bool = fetch_derivatives_inputs
+        # Macro inputs (DVOL, stablecoin marks) and Hyperliquid auxiliary feeds share the live-feeds switch.
+        self._macro_feed: MacroInputsFeed = macro_feed or (
+            LiveMacroInputsFeed() if fetch_derivatives_inputs else ScriptedMacroInputsFeed()
+        )
+        self._aux_feed: HyperliquidAuxFeed = aux_feed or (
+            LiveHyperliquidAuxFeed() if fetch_derivatives_inputs else ScriptedHyperliquidAuxFeed()
+        )
+        self._latest_macro_inputs: MacroInputs = MacroInputs()
+        self._latest_aux: HyperliquidAuxSnapshot = HyperliquidAuxSnapshot()
 
         self._starting_capital_usd: float = 5_000.0
         self._base_capital_usd: float = 5_000.0
@@ -436,9 +457,13 @@ class ControlCenterStateStore:
         self._data_availability = self._data_availability.model_copy(
             update={"hourly_return_rows": self._hourly_returns.n_rows}
         )
+        self._data_availability = self._availability_with_feeds(self._data_availability)
 
-        # Risk committee baseline from live funding and prices.
+        # Risk committee baseline from live funding, prices, DVOL and stablecoin marks (P0.8).
+        self._latest_macro_inputs = self._refresh_macro_inputs(multi_snap.timestamp_ns)
+        self._latest_aux = self._refresh_aux(multi_snap.timestamp_ns)
         self._latest_committee_output: RiskCommitteeOutput = self._compute_initial_risk_committee(multi_snap)
+        self._data_availability = self._availability_with_feeds(self._data_availability)
 
         # Microstructure monitors and the Stage-1 SVD + Stage-2 LightGBM worker (trained on real rows only).
         self._vpin_monitor = RollingBVCVPINMonitor(bucket_volume=500.0, num_buckets=50)
@@ -519,7 +544,7 @@ class ControlCenterStateStore:
         prices = {coin: a.mid_price for coin in ASSETS if (a := snap.get_asset(coin)) is not None}
         fundings = {coin: a.funding_rate_1h for coin in ASSETS if (a := snap.get_asset(coin)) is not None}
         try:
-            macro_out = self._risk_sentinel.evaluate(stablecoin_depeg_bps=1.5, dvol_index=51.0)
+            macro_out = self._evaluate_macro_sentinel()
             breadth_out = self._risk_breadth.evaluate(
                 MultiAssetTelemetry(asset_prices=prices, funding_rates_1h=fundings)
                 if len(prices) == len(ASSETS)
@@ -955,6 +980,28 @@ class ControlCenterStateStore:
                 "last_retrain_message": self._last_retrain_message,
                 "sigma_bar_ewma96": round(self._sigma_estimator.value, 6),
             },
+            "macro_inputs": {
+                "stablecoin_depeg_bps": self._latest_macro_inputs.stablecoin_depeg_bps,
+                "dvol_index": self._latest_macro_inputs.dvol_index,
+                "dvol_zscore": self._latest_macro_inputs.dvol_zscore,
+                "stablecoin_medians_usd": (
+                    self._latest_macro_inputs.stablecoin_marks.median_usd
+                    if self._latest_macro_inputs.stablecoin_marks is not None
+                    else {}
+                ),
+                "stablecoin_venues": (
+                    self._latest_macro_inputs.stablecoin_marks.venues_per_symbol
+                    if self._latest_macro_inputs.stablecoin_marks is not None
+                    else {}
+                ),
+            },
+            "hyperliquid_aux": {
+                "oi_cap_assets": sorted(self._latest_aux.oi_cap_assets),
+                "predicted_funding_per_day": {
+                    coin: {venue: round(pf.rate_per_day, 8) for venue, pf in venues.items()}
+                    for coin, venues in self._latest_aux.predicted_fundings.items()
+                },
+            },
             "hrp_weights": dict(self._latest_hrp_weights),
             "hrp_is_fallback": self._hrp_scheduler.last_result_is_fallback,
             "hourly_return_rows": self._hourly_returns.n_rows,
@@ -1002,6 +1049,57 @@ class ControlCenterStateStore:
     @staticmethod
     def _now_str() -> str:
         return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    # ------------------------------------------------------------------ macro / auxiliary feeds (P0.8, P1.4)
+
+    def _refresh_macro_inputs(self, ts_ns: int) -> MacroInputs:
+        try:
+            return self._macro_feed.macro_inputs(ts_ns)
+        except Exception as exc:
+            logger.warning("Macro inputs feed failed: %s", exc)
+            return MacroInputs(ts_ns=ts_ns)
+
+    def _refresh_aux(self, ts_ns: int) -> HyperliquidAuxSnapshot:
+        try:
+            return self._aux_feed.aux_snapshot(ts_ns, ASSETS)
+        except Exception as exc:
+            logger.warning("Hyperliquid auxiliary feed failed: %s", exc)
+            return HyperliquidAuxSnapshot(ts_ns=ts_ns)
+
+    def _evaluate_macro_sentinel(self) -> MacroSentinelOutput:
+        """Macro sentinel on fetched inputs. A missing feed contributes no stress (0 bps, default DVOL) and is flagged."""
+        mi = self._latest_macro_inputs
+        depeg = float(mi.stablecoin_depeg_bps) if mi.stablecoin_depeg_bps is not None else 0.0
+        if mi.dvol_index is not None:
+            return self._risk_sentinel.evaluate(
+                stablecoin_depeg_bps=depeg,
+                dvol_index=float(mi.dvol_index),
+                dvol_zscore=float(mi.dvol_zscore or 0.0),
+            )
+        return self._risk_sentinel.evaluate(stablecoin_depeg_bps=depeg)
+
+    @property
+    def latest_macro_inputs(self) -> MacroInputs:
+        """DVOL and stablecoin inputs used by the latest committee evaluation."""
+        return self._latest_macro_inputs
+
+    @property
+    def latest_aux_snapshot(self) -> HyperliquidAuxSnapshot:
+        """Latest Hyperliquid predicted fundings and OI-cap list."""
+        return self._latest_aux
+
+    def _availability_with_feeds(self, base: DataAvailability) -> DataAvailability:
+        mi = self._latest_macro_inputs
+        aux = self._latest_aux
+        return base.model_copy(
+            update={
+                "dvol": mi.dvol_available,
+                "stablecoin_marks": mi.stablecoin_marks_available,
+                "predicted_fundings": aux.predicted_fundings_available,
+                "oi_caps": aux.oi_caps_available,
+                "checked_at_ns": max(base.checked_at_ns, mi.ts_ns, aux.ts_ns),
+            }
+        )
 
     # ------------------------------------------------------------------ market context helpers
 
@@ -1520,12 +1618,14 @@ class ControlCenterStateStore:
         self._hourly_returns.update(ts_close, hourly_prices)
         self._latest_hrp_weights = self._hrp_scheduler.compute(ts_close, self._hourly_returns.matrix())
         feed_avail = self._feed.availability
-        self._data_availability = feed_avail.model_copy(
-            update={
-                "hourly_return_rows": self._hourly_returns.n_rows,
-                "options_surface": self._data_availability.options_surface,
-                "hlp_vault": self._data_availability.hlp_vault,
-            }
+        self._data_availability = self._availability_with_feeds(
+            feed_avail.model_copy(
+                update={
+                    "hourly_return_rows": self._hourly_returns.n_rows,
+                    "options_surface": self._data_availability.options_surface,
+                    "hlp_vault": self._data_availability.hlp_vault,
+                }
+            )
         )
         self._maybe_retrain(ts_close)
 
@@ -1571,7 +1671,9 @@ class ControlCenterStateStore:
         if "BTC" in bars_by_coin:
             prices["BTC"] = new_bar.close
             fundings["BTC"] = new_bar.funding_rate_1h
-        macro_eval = self._risk_sentinel.evaluate(stablecoin_depeg_bps=1.5, dvol_index=51.0)
+        self._latest_macro_inputs = self._refresh_macro_inputs(ts_close)
+        self._latest_aux = self._refresh_aux(ts_close)
+        macro_eval = self._evaluate_macro_sentinel()
         breadth_eval = self._risk_breadth.evaluate(
             MultiAssetTelemetry(asset_prices=prices, funding_rates_1h=fundings)
         )
@@ -2010,6 +2112,8 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
             "open_positions": [p.model_dump(mode="json") for p in store.position_manager.open_positions.values()],
             "sleeve_targets": {k: t.model_dump(mode="json") for k, t in store.latest_targets.items()},
             "data_availability": store.data_availability.model_dump(mode="json"),
+            "live_feeds": store.data_availability.live_feeds(),
+            "macro_inputs": store.latest_macro_inputs.model_dump(mode="json", exclude={"stablecoin_marks", "dvol"}),
             "sigma_bar_ewma96": store.sigma_bar,
         }
     )

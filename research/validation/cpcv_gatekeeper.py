@@ -866,9 +866,31 @@ class ChampionChallengerGatekeeper:
         self,
         validation_result: CPCVValidationResult,
         live_psr_on_promotion: float | None = None,
+        *,
+        sample_bars: int | None = None,
+        bars_per_year: float = 365.0 * 96.0,
+        target_sharpe_annual: float = 1.0,
     ) -> ChampionChallengerState:
-        """Evaluate a newly trained Challenger's CPCVValidationResult and update sleeve state."""
-        if validation_result.passed_all_gates:
+        """Evaluate a newly trained Challenger's CPCVValidationResult and update sleeve state.
+
+        When ``sample_bars`` is given, promotion is refused if the sample is shorter than the
+        minimum backtest length for ``validation_result.total_trials`` trials at
+        ``target_sharpe_annual`` (REINFORCEMENT_PLAN P1.6, MinBTL).
+        """
+        min_btl_reason: str | None = None
+        if sample_bars is not None:
+            from research.trial_registry import passes_min_backtest_length
+
+            ok, sample_years, min_years = passes_min_backtest_length(
+                sample_bars, validation_result.total_trials, target_sharpe_annual, bars_per_year
+            )
+            if not ok:
+                min_btl_reason = (
+                    f"sample={sample_years:.2f}y < MinBTL={min_years:.2f}y for "
+                    f"{validation_result.total_trials} trials at SR*={target_sharpe_annual:.2f}"
+                )
+
+        if validation_result.passed_all_gates and min_btl_reason is None:
             new_live_psr = (
                 float(min(max(live_psr_on_promotion, 0.0), 1.0))
                 if live_psr_on_promotion is not None
@@ -889,8 +911,11 @@ class ChampionChallengerGatekeeper:
             )
             return self._state
 
-        # Challenger failed at least one gate -> discard Challenger
-        failed_gates_str = ", ".join(self._format_failed_gates(validation_result))
+        # Challenger failed at least one gate (or the MinBTL rule) -> discard Challenger
+        failed = self._format_failed_gates(validation_result)
+        if min_btl_reason is not None:
+            failed.append(min_btl_reason)
+        failed_gates_str = ", ".join(failed)
         new_failed_count = self._state.consecutive_failed_retrains + 1
 
         should_fallback = (

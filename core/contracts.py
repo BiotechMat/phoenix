@@ -865,5 +865,30 @@ class DataAvailability(BaseModel):
     funding_history: bool = False
     options_surface: bool = False
     hlp_vault: bool = False
+    predicted_fundings: bool = False
+    oi_caps: bool = False
+    dvol: bool = False
+    stablecoin_marks: bool = False
+    trades: bool = False
+    lead_mids: bool = False
     hourly_return_rows: int = Field(default=0, ge=0)
     feed_source: str = "UNAVAILABLE"
+    checked_at_ns: int = Field(default=0, ge=0)
+
+    def live_feeds(self) -> dict[str, bool]:
+        """Boolean feed flags in display order."""
+        return {
+            "candles": self.candles,
+            "funding_history": self.funding_history,
+            "open_interest_history": self.open_interest_history,
+            "predicted_fundings": self.predicted_fundings,
+            "oi_caps": self.oi_caps,
+            "options_surface": self.options_surface,
+            "hlp_vault": self.hlp_vault,
+            "dvol": self.dvol,
+            "stablecoin_marks": self.stablecoin_marks,
+            "taker_flow": self.taker_flow,
+            "liquidations": self.liquidations,
+            "trades": self.trades,
+            "lead_mids": self.lead_mids,
+        }

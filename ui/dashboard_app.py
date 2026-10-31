@@ -1471,6 +1471,15 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       </div>
     </div>
 
+    <!-- LIVE FEED AVAILABILITY -->
+    <div class="feed-box" style="margin-bottom: 20px;" title="Which inputs come from a live feed right now. Anything marked missing is zero-filled or ignored, never invented.">
+      <h3>📡 Live Feed Availability</h3>
+      <div id="feed-availability" style="display: flex; flex-wrap: wrap; gap: 8px; font-size: 0.8rem; margin-top: 8px;">
+        <span class="pos-pill">waiting for first poll…</span>
+      </div>
+      <div id="feed-availability-sub" style="margin-top: 8px; font-size: 0.78rem; color: var(--muted);"></div>
+    </div>
+
     <!-- 3-MODEL MLX RISK COMMITTEE TELEMETRY -->
     <div class="feed-box" style="margin-bottom: 20px;" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['risk_committee_models'])}">
       <h3>
@@ -1943,12 +1952,38 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
         }}
       }}
 
+      // Update Live Feed Availability
+      if (state.live_feeds) {{
+        const box = document.getElementById('feed-availability');
+        if (box) {{
+          box.innerHTML = '';
+          Object.entries(state.live_feeds).forEach(([name, ok]) => {{
+            const pill = document.createElement('span');
+            pill.className = 'pos-pill ' + (ok ? 'pos-long' : 'pos-short');
+            pill.textContent = (ok ? '● ' : '○ ') + name.replace(/_/g, ' ') + (ok ? '' : ' (missing)');
+            box.appendChild(pill);
+          }});
+        }}
+        const sub = document.getElementById('feed-availability-sub');
+        const mi = state.macro_inputs || {{}};
+        if (sub) {{
+          const depeg = (mi.stablecoin_depeg_bps === null || mi.stablecoin_depeg_bps === undefined) ? 'n/a' : Number(mi.stablecoin_depeg_bps).toFixed(1) + ' bps';
+          const dvol = (mi.dvol_index === null || mi.dvol_index === undefined) ? 'n/a' : Number(mi.dvol_index).toFixed(1) + ' (z ' + Number(mi.dvol_zscore || 0).toFixed(2) + ')';
+          const src = state.data_availability ? state.data_availability.feed_source : 'n/a';
+          sub.textContent = `Bar feed: ${{src}} • Stablecoin max peg deviation: ${{depeg}} • Deribit DVOL: ${{dvol}} • Hourly return rows: ${{state.data_availability ? state.data_availability.hourly_return_rows : 'n/a'}}`;
+        }}
+      }}
+
       // Update 3-Model MLX Risk Committee Telemetry Box
       if (rc) {{
         const consensusBadge = document.getElementById('risk-consensus-badge');
         if (consensusBadge) consensusBadge.textContent = 'Consensus M_regime: ' + Number(rc.regime_multiplier).toFixed(2);
         const sentinelScore = document.getElementById('risk-sentinel-score');
         if (sentinelScore) sentinelScore.textContent = Number(rc.macro_sentinel_score).toFixed(1) + ' / 100';
+        const sentinelSub = document.getElementById('risk-sentinel-sub');
+        if (sentinelSub && rc.macro_sentinel) {{
+          sentinelSub.textContent = `Peg Dev: ${{Number(rc.macro_sentinel.stablecoin_depeg_bps).toFixed(1)}} bps • DVOL: ${{Number(rc.macro_sentinel.dvol_index).toFixed(1)}} (z ${{Number(rc.macro_sentinel.dvol_zscore).toFixed(2)}}) • ${{rc.macro_sentinel.regime_label}}`;
+        }}
         const breadthScore = document.getElementById('risk-breadth-score');
         if (breadthScore) breadthScore.textContent = Number(rc.breadth_analyst_score).toFixed(1) + ' / 100';
         const criticScore = document.getElementById('risk-critic-score');

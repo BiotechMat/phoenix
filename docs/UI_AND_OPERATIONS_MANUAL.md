@@ -130,3 +130,7 @@ Never rush directly into live capital. Follow this 5-step graduation protocol:
 
 - **Backfill**: `.venv/bin/python scripts/backfill.py --months 12` fills `data/*usdt_perp_bars.parquet` (15m) and `data/*usdt_perp_bars_1h.parquet` with real candles, mark and index prices, Hyperliquid funding and open interest for BTC, ETH and SOL. Bybit is preferred; OKX is the fallback. The table it prints shows rows, gaps and which venue supplied what. Once the 15m store has about five hundred bars with open interest, the AI win-probability model trains at the next start.
 - **Replay**: `.venv/bin/python -m research.replay --scenario calm_2025_09` (or `--start`/`--end` for any window) runs the same engine as the dashboard over stored bars, with no network, and writes a JSON report to `data/replays/` with every trade, the equity curve, fees, funding and per-sleeve results.
+
+## Live feed availability panel
+
+The "Live Feed Availability" box lists every input the engine can use and whether a real feed is supplying it right now: candles, funding history, open-interest history, predicted fundings, open-interest caps, options surface, HLP vault, Deribit DVOL, stablecoin marks, taker flow, liquidations, trades and lead-venue mids. A grey pill means the feed is missing; the engine then treats that input as unknown (zero or ignored) and says so, rather than filling it with a guess. The line under the pills shows the current stablecoin peg deviation and DVOL that the macro sentinel is using.
