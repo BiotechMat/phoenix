@@ -264,14 +264,18 @@ class ControlCenterStateStore:
             pnl_delta_usd = round(abs(wave) * 0.45 + 14.20, 2)
 
         new_net_pnl_usd = round(s.pnl_metrics.net_pnl_usd + pnl_delta_usd, 2)
-        new_net_pnl_bps = round(s.pnl_metrics.net_pnl_bps + (pnl_delta_usd / 34.0), 1)
+        starting_cap = s.pnl_metrics.starting_capital_usd
+        new_net_pnl_bps = round((new_net_pnl_usd / starting_cap) * 10_000.0, 1)
+        fee_paid_this_bar = round(abs(pnl_delta_usd) * 0.06, 2)
+        new_total_fees = round(s.pnl_metrics.total_fees_paid_usd + fee_paid_this_bar, 2)
         new_fee_savings = round(s.pnl_metrics.fee_savings_usd + (3.85 if pnl_delta_usd != 0 else 0.0), 2)
 
         updated_pnl = PnLAndExecutionMetrics(
+            starting_capital_usd=starting_cap,
             net_pnl_usd=new_net_pnl_usd,
             net_pnl_bps=new_net_pnl_bps,
-            gross_pnl_usd=round(new_net_pnl_usd + s.pnl_metrics.total_fees_paid_usd, 2),
-            total_fees_paid_usd=s.pnl_metrics.total_fees_paid_usd,
+            gross_pnl_usd=round(new_net_pnl_usd + new_total_fees, 2),
+            total_fees_paid_usd=new_total_fees,
             maker_fill_ratio=s.pnl_metrics.maker_fill_ratio,
             taker_fill_ratio=s.pnl_metrics.taker_fill_ratio,
             fee_savings_usd=new_fee_savings,
@@ -463,6 +467,8 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
             "tick_count": store.tick_counter,
             "auto_running": store.auto_running,
             "latest_price": s.dollar_bars[-1].close,
+            "starting_capital_usd": s.pnl_metrics.starting_capital_usd,
+            "current_equity_usd": s.pnl_metrics.current_equity_usd,
             "net_pnl_usd": s.pnl_metrics.net_pnl_usd,
             "net_pnl_bps": s.pnl_metrics.net_pnl_bps,
             "maker_fill_ratio": s.pnl_metrics.maker_fill_ratio,

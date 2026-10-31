@@ -142,20 +142,26 @@ PLAIN_ENGLISH_TOOLTIPS: dict[str, str] = {
 
 
 class PnLAndExecutionMetrics(BaseModel):
-    """Live net-of-fee PnL, Maker/Taker ratio, and fee-saving telemetry."""
+    """Live net-of-fee PnL, starting paper capital, Maker/Taker ratio, and fee-saving telemetry."""
 
     model_config = ConfigDict(frozen=True)
 
-    net_pnl_usd: float = Field(default=4820.50)
-    net_pnl_bps: float = Field(default=142.8)
-    gross_pnl_usd: float = Field(default=5410.00)
-    total_fees_paid_usd: float = Field(default=589.50)
+    starting_capital_usd: float = Field(default=100_000.00)
+    net_pnl_usd: float = Field(default=0.00)
+    net_pnl_bps: float = Field(default=0.0)
+    gross_pnl_usd: float = Field(default=0.00)
+    total_fees_paid_usd: float = Field(default=0.00)
     maker_fill_ratio: float = Field(default=0.914, ge=0.0, le=1.0)
     taker_fill_ratio: float = Field(default=0.086, ge=0.0, le=1.0)
-    fee_savings_usd: float = Field(default=1124.75, ge=0.0)
+    fee_savings_usd: float = Field(default=0.00, ge=0.0)
     fee_savings_bps: float = Field(default=31.5, ge=0.0)
     annualized_carry_apr_pct: float = Field(default=14.8)
     is_dry_run: bool = Field(default=True)
+
+    @property
+    def current_equity_usd(self) -> float:
+        """Current total paper account equity ($100,000 starting capital + net PnL)."""
+        return self.starting_capital_usd + self.net_pnl_usd
 
 
 class DashboardTelemetryState(BaseModel):
@@ -532,12 +538,12 @@ def build_candlestick_dollar_bar_figure(
         rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
-        row_heights=[0.52, 0.24, 0.24],
+        vertical_spacing=0.10,
+        row_heights=[0.54, 0.23, 0.23],
         subplot_titles=(
-            f"{resolved.active_instrument} Dynamic Dollar Bars + Triple-Barrier Bands & Squeeze Regimes",
-            "Stage-2 LightGBM Meta-Probability (p_meta) & VPIN / O(1) Hawkes Shield",
-            "Mahalanobis Outlier Gate (DI_values) & ASRI Macro Risk Score",
+            f"{resolved.active_instrument} Price Bars + Profit Target (Green) & Stop-Loss (Red)",
+            "AI Win Probability (p_meta) & Order-Book Toxicity Shield (VPIN / Hawkes)",
+            "Unfamiliar Market Check (Mahalanobis DI) & Macro Weather (ASRI)",
         ),
     )
 
@@ -549,7 +555,7 @@ def build_candlestick_dollar_bar_figure(
             high=highs,
             low=lows,
             close=closes,
-            name="Dollar Bars (OHLC)",
+            name="Price (OHLC)",
             increasing_line_color="#10b981",
             decreasing_line_color="#ef4444",
         ),
@@ -564,9 +570,9 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_barriers)],
                 y=[b.upper_barrier for b in use_barriers],
                 mode="lines",
-                name="Triple-Barrier Profit Target (>=80 bps)",
+                name="Profit Target (>=80 bps)",
                 line={"color": "#34d399", "width": 2, "dash": "dash"},
-                hovertemplate="Profit Barrier: $%{y:,.2f}<extra>Triple-Barrier Top Wall</extra>",
+                hovertemplate="Profit Target: $%{y:,.2f}<extra>Triple-Barrier Top Wall</extra>",
             ),
             row=1,
             col=1,
@@ -576,15 +582,15 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_barriers)],
                 y=[b.lower_barrier for b in use_barriers],
                 mode="lines",
-                name="Triple-Barrier Stop-Loss Band",
+                name="Stop-Loss Band",
                 line={"color": "#f87171", "width": 2, "dash": "dot"},
-                hovertemplate="Stop Barrier: $%{y:,.2f}<extra>Triple-Barrier Bottom Wall</extra>",
+                hovertemplate="Stop-Loss: $%{y:,.2f}<extra>Triple-Barrier Bottom Wall</extra>",
             ),
             row=1,
             col=1,
         )
 
-    # Trace 3: Funding / OI Squeeze Regime Markers
+    # Trace 3: Funding / OI Squeeze Regime Markers (clean markers only, text on hover so zero overlap!)
     if use_pos:
         regime_colors = {
             PositioningRegime.CROWDED_SHORT_SQUEEZE: "#22c55e",
@@ -596,18 +602,18 @@ def build_candlestick_dollar_bar_figure(
         fig.add_trace(
             go.Scatter(
                 x=x_labels[: len(use_pos)],
-                y=[closes[i] + 140.0 for i in range(min(len(use_pos), len(closes)))],
-                mode="markers+text",
-                name="Funding/OI Squeeze Regimes",
+                y=[highs[i] + 65.0 for i in range(min(len(use_pos), len(highs)))],
+                mode="markers",
+                name="Regime Signal (Hover)",
                 text=[p.regime.value.replace("_", " ") for p in use_pos],
-                textposition="top center",
                 marker={
-                    "size": 11,
+                    "size": 9,
                     "color": [regime_colors.get(p.regime, "#94a3b8") for p in use_pos],
                     "symbol": "diamond",
+                    "line": {"width": 1, "color": "#0f172a"},
                 },
                 hovertemplate=(
-                    "<b>%{text}</b><br>Price: $%{y:,.2f}<extra>Perpetual Positioning & Squeeze Regime</extra>"
+                    "<b>%{text}</b><br>Marker Level: $%{y:,.2f}<extra>Positioning Regime</extra>"
                 ),
             ),
             row=1,
@@ -621,9 +627,10 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_meta)],
                 y=[m.p_meta for m in use_meta],
                 mode="lines+markers",
-                name="LightGBM Meta-Probability (p_meta)",
+                name="AI Win Prob (p_meta)",
                 line={"color": "#60a5fa", "width": 2.5},
-                hovertemplate="p_meta: %{y:.2%}<extra>Sniper Quality Inspector (Pass > 50%)</extra>",
+                marker={"size": 6},
+                hovertemplate="AI Confidence (p_meta): %{y:.1%}<extra>Pass > 50%</extra>",
             ),
             row=2,
             col=1,
@@ -636,9 +643,9 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_hawkes)],
                 y=[h.vpin for h in use_hawkes],
                 mode="lines",
-                name="VPIN Toxicity (Threshold 0.60)",
+                name="VPIN Toxicity (<=0.60)",
                 line={"color": "#f59e0b", "width": 2},
-                hovertemplate="VPIN: %{y:.2f}<extra>Order Book Toxicity Shield</extra>",
+                hovertemplate="VPIN Toxicity: %{y:.2f}<extra>Safe <= 0.60</extra>",
             ),
             row=2,
             col=1,
@@ -648,9 +655,9 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_hawkes)],
                 y=[h.branching_ratio_eta for h in use_hawkes],
                 mode="lines",
-                name="O(1) Hawkes Reflexivity (eta, Threshold 0.70)",
+                name="Hawkes Avalanche (<=0.70)",
                 line={"color": "#ec4899", "width": 2, "dash": "dashdot"},
-                hovertemplate="Hawkes eta: %{y:.2f}<extra>Self-Exciting Avalanche Meter</extra>",
+                hovertemplate="Hawkes eta: %{y:.2f}<extra>Safe <= 0.70</extra>",
             ),
             row=2,
             col=1,
@@ -663,9 +670,10 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_meta)],
                 y=[m.mahalanobis_di for m in use_meta],
                 mode="lines+markers",
-                name="Mahalanobis DI_values (Outlier Distance)",
+                name="Outlier Distance (DI)",
                 line={"color": "#c084fc", "width": 2.5},
-                hovertemplate="Mahalanobis DI: %{y:.2f}<extra>Uncharted Territory Detector</extra>",
+                marker={"size": 6},
+                hovertemplate="Mahalanobis DI: %{y:.2f}<extra>Unfamiliar Market Check</extra>",
             ),
             row=3,
             col=1,
@@ -675,9 +683,9 @@ def build_candlestick_dollar_bar_figure(
                 x=x_labels[: len(use_meta)],
                 y=[m.di_threshold for m in use_meta],
                 mode="lines",
-                name="Mahalanobis Safety Ceiling (DI Threshold)",
+                name="Max Safe DI Limit (3.50)",
                 line={"color": "#ef4444", "width": 1.5, "dash": "dash"},
-                hovertemplate="Max Safe DI: %{y:.2f}<extra>Epistemic Gate Veto Line</extra>",
+                hovertemplate="Max Safe DI: %{y:.2f}<extra>Safety Ceiling</extra>",
             ),
             row=3,
             col=1,
@@ -688,54 +696,32 @@ def build_candlestick_dollar_bar_figure(
             x=x_labels,
             y=[use_asri.score / 25.0 for _ in x_labels],
             mode="lines",
-            name=f"ASRI Macro Score ({use_asri.score:.1f}/100 - {use_asri.plain_english_summary[:48]}...)",
+            name=f"Macro Risk ASRI ({use_asri.score:.0f}/100)",
             line={"color": "#2dd4bf", "width": 2, "dash": "dot"},
             customdata=[use_asri.plain_english_summary for _ in x_labels],
-            hovertemplate="ASRI Scaled: %{y:.2f}<br>%{customdata}<extra>Qwen3-8B Macro Risk</extra>",
+            hovertemplate="ASRI Score: " + f"{use_asri.score:.1f}/100" + "<br>%{customdata}<extra>Macro Weather</extra>",
         ),
         row=3,
         col=1,
     )
 
-    n_traces = len(fig.data)
-    all_visible = [True] * n_traces
-
-    def _mask(indices: set[int]) -> list[bool]:
-        return [i in indices or i == 0 for i in range(n_traces)]
-
+    fig.update_annotations(font_size=12, font_color="#cbd5e1")
     fig.update_layout(
-        title={
-            "text": (
-                f"<b>{resolved.active_instrument} Live Dollar-Bar Cockpit</b> — "
-                f"ASRI: {use_asri.score:.1f}/100 | {use_asri.plain_english_summary}"
-            ),
-            "font": {"size": 14, "color": "#f8fafc"},
-        },
         template="plotly_dark",
-        paper_bgcolor="#0f172a",
-        plot_bgcolor="#1e293b",
-        height=760,
-        margin={"l": 55, "r": 35, "t": 95, "b": 45},
+        paper_bgcolor="#152033",
+        plot_bgcolor="#0f172a",
+        height=680,
+        margin={"l": 55, "r": 25, "t": 38, "b": 85},
         xaxis_rangeslider_visible=False,
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0.0},
-        updatemenus=[
-            {
-                "type": "buttons",
-                "direction": "right",
-                "x": 0.0,
-                "y": 1.13,
-                "bgcolor": "#1e293b",
-                "font": {"color": "#e2e8f0", "size": 11},
-                "buttons": [
-                    {"label": "All Overlays", "method": "update", "args": [{"visible": all_visible}]},
-                    {"label": "Triple-Barrier Bands", "method": "update", "args": [{"visible": _mask({1, 2})}]},
-                    {"label": "Squeeze Regimes", "method": "update", "args": [{"visible": _mask({3})}]},
-                    {"label": "Meta-Prob (p_meta)", "method": "update", "args": [{"visible": _mask({4})}]},
-                    {"label": "VPIN & Hawkes Shield", "method": "update", "args": [{"visible": _mask({5, 6})}]},
-                    {"label": "Mahalanobis DI & ASRI", "method": "update", "args": [{"visible": _mask({7, 8, 9})}]},
-                ],
-            }
-        ],
+        legend={
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.07,
+            "xanchor": "center",
+            "x": 0.5,
+            "font": {"size": 11, "color": "#cbd5e1"},
+            "bgcolor": "rgba(15, 23, 42, 0.7)",
+        },
     )
     return fig
 
@@ -796,19 +782,19 @@ def build_portfolio_weights_figure(
     fig.update_layout(
         title={
             "text": (
-                f"<b>Signed HRP-CVaR Target Portfolio Weights (w_final,i)</b> — "
-                f"Gross Leverage: {alloc.gross_leverage:.2f}x / 2.50x Cap | "
-                f"Regime Multiplier (M_regime): {alloc.regime_multiplier:.2f}"
+                f"<b>Target Portfolio Weights</b> — "
+                f"Total Leverage: {alloc.gross_leverage:.2f}x / 2.50x Cap"
             ),
             "font": {"size": 14, "color": "#f8fafc"},
         },
         barmode="group",
         template="plotly_dark",
-        paper_bgcolor="#0f172a",
-        plot_bgcolor="#1e293b",
+        paper_bgcolor="#152033",
+        plot_bgcolor="#0f172a",
         height=420,
-        margin={"l": 50, "r": 30, "t": 70, "b": 45},
-        yaxis_title="Portfolio Weight / Fraction of Equity",
+        margin={"l": 55, "r": 25, "t": 55, "b": 75},
+        yaxis_title="Portfolio Weight",
+        legend={"orientation": "h", "yanchor": "top", "y": -0.15, "xanchor": "center", "x": 0.5},
     )
     return fig
 
@@ -887,18 +873,18 @@ def build_validation_gates_figure(
         title={
             "text": (
                 f"<b>45-Split CPCV Promotion Gatekeeper</b> — "
-                f"Champion Sharpe: {champ.sharpe_net:.2f} ({champ.expected_net_pnl_bps:.1f} bps) vs. "
-                f"Challenger Sharpe: {chall.sharpe_net:.2f} ({chall.expected_net_pnl_bps:.1f} bps)"
+                f"Champion Sharpe: {champ.sharpe_net:.2f} vs. Challenger Sharpe: {chall.sharpe_net:.2f}"
             ),
             "font": {"size": 14, "color": "#f8fafc"},
         },
         barmode="group",
         template="plotly_dark",
-        paper_bgcolor="#0f172a",
-        plot_bgcolor="#1e293b",
+        paper_bgcolor="#152033",
+        plot_bgcolor="#0f172a",
         height=420,
-        margin={"l": 50, "r": 30, "t": 70, "b": 45},
-        yaxis_title="Score / Ratio vs. Gate Threshold",
+        margin={"l": 55, "r": 25, "t": 55, "b": 75},
+        yaxis_title="Gate Score / Ratio",
+        legend={"orientation": "h", "yanchor": "top", "y": -0.15, "xanchor": "center", "x": 0.5},
     )
     return fig
 
@@ -1325,9 +1311,9 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
   <!-- 4 SIMPLE, PLAIN-ENGLISH SUMMARY CARDS -->
   <div class="simple-kpi-grid">
     <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['net_of_fee_pnl'])}">
-      <div class="kpi-label">1. Total Profit (After All Fees) (?)</div>
+      <div class="kpi-label">1. Live Paper Profit (On $100,000 Capital) (?)</div>
       <div id="kpi-pnl-val" class="kpi-main" style="color: var(--green);">+${resolved.pnl_metrics.net_pnl_usd:,.2f}</div>
-      <div id="kpi-pnl-sub" class="kpi-sub">+{resolved.pnl_metrics.net_pnl_bps:.1f} bps net • Saved ${resolved.pnl_metrics.fee_savings_usd:,.2f} via Maker orders</div>
+      <div id="kpi-pnl-sub" class="kpi-sub">Account Equity: <strong>${resolved.pnl_metrics.current_equity_usd:,.2f}</strong> ({resolved.pnl_metrics.net_pnl_bps:+.1f} bps net of fees)</div>
     </div>
 
     <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['hrp_cvar_weights'])}">
@@ -1587,13 +1573,16 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
         document.getElementById('live-btc-price').textContent = '$' + Number(state.latest_price).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
       }}
 
-      // Update KPI Card 1: PnL
+      // Update KPI Card 1: PnL on $100,000 Paper Account
       if (state.net_pnl_usd !== undefined) {{
+        const startCap = state.starting_capital_usd || 100000;
+        const equity = startCap + Number(state.net_pnl_usd);
         const pnlSign = state.net_pnl_usd >= 0 ? '+' : '';
         document.getElementById('kpi-pnl-val').textContent = pnlSign + '$' + Number(state.net_pnl_usd).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
-        document.getElementById('kpi-pnl-sub').textContent =
-          (state.net_pnl_bps >= 0 ? '+' : '') + Number(state.net_pnl_bps).toFixed(1) +
-          ' bps net • Saved $' + Number(state.fee_savings_usd || 0).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + ' via Maker orders';
+        document.getElementById('kpi-pnl-sub').innerHTML =
+          'Account Equity: <strong>$' + equity.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + '</strong> (' +
+          (state.net_pnl_bps >= 0 ? '+' : '') + Number(state.net_pnl_bps).toFixed(1) + ' bps net | Saved $' +
+          Number(state.fee_savings_usd || 0).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + ' in fees)';
       }}
 
       // Update KPI Card 2 & Weights tables
