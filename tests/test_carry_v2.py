@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from data.backfill_storage import FundingSettlement, load_settlements, normalize_funding_to_hourly, save_settlements
-from research.carry_eval import _round_trips, evaluate_asset, inversion_bound, simulate
+from research.carry_eval import _round_trips, evaluate_asset, inversion_bound, rolling_oi_percentile, simulate
 from research.trial_registry import TrialRegistry
 from sleeves.sleeve_3_funding_carry import CarryV2Config, carry_v2_decide, compute_deviation_rho
 
@@ -79,3 +79,22 @@ def test_settlements_round_trip_through_parquet_and_registry(tmp_path: Path) -> 
     res = evaluate_asset("BTC", st, "v2", reg)
     assert reg.count("carry") == 1 and res.trial_id
     assert res.round_trips == 200 and res.aug_2024_drawdown is None  # synthetic window lies outside August 2024
+
+
+def test_crowding_needs_high_open_interest_when_oi_is_known() -> None:
+    kw = dict(in_position=False, premium=0.0012, funding_per_hour=0.00003, trailing_funding_per_hour=0.00002)
+    assert carry_v2_decide(**kw, oi_percentile=0.95).size == 0.5  # hot funding and OI above p90
+    assert carry_v2_decide(**kw, oi_percentile=0.50).size == 1.0  # hot funding alone is not crowding
+    assert carry_v2_decide(**kw, oi_percentile=0.50, oi_cap_hit=True).size == 0.5
+    assert carry_v2_decide(**kw).size == 0.5  # OI unknown: funding decides, as before
+
+
+def test_rolling_oi_percentile_is_causal_mid_rank() -> None:
+    series = [(i * H, float(i)) for i in range(100)]
+    pct = rolling_oi_percentile(series, [50 * H, 50 * H + 30 * 60_000, 99 * H, 200 * H], window_hours=48)
+    assert pct[0] == pytest.approx((48 + 0.5) / 49)  # newest of the 49 values in the window
+    assert pct[1] == pct[0]  # between observations: the last known value
+    assert pct[2] == pytest.approx(pct[0])
+    assert math.isnan(pct[3])  # stale by more than two hours
+    flat = rolling_oi_percentile([(i * H, 5.0) for i in range(30)], [29 * H])
+    assert flat[0] == pytest.approx(0.5)

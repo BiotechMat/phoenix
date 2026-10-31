@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.contracts import AssetMarketSnapshot, DataAvailability, DollarBar, MultiAssetMarketSnapshot
 from core.data_ingestion import ScriptedBarFeed, normalize_coin_symbol
+from risk.cascade_controls import CascadeConfig, CascadeController
 from risk.circuit_breakers import CircuitBreakers
 from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaSleeve
 from sleeves.sleeve_3_funding_carry import FundingCarrySleeve
@@ -152,6 +153,7 @@ class ScenarioData(BaseModel):
     live_by_coin: dict[str, list[DollarBar]]
     hourly_closes_by_coin: dict[str, list[tuple[int, float]]]
     training_bars: list[DollarBar] = Field(default_factory=list)
+    taker_flow_in_bars: bool = False  # every window row carries venue-reported taker buy volume
 
 
 # ------------------------------------------------------------------------------------------------
@@ -159,7 +161,9 @@ class ScenarioData(BaseModel):
 # ------------------------------------------------------------------------------------------------
 
 
-def bars_from_parquet(path: Path, *, forward_fill_open_interest: bool = True) -> list[DollarBar]:
+def bars_from_parquet(
+    path: Path, *, forward_fill_open_interest: bool = True, min_close_ns: int | None = None, max_close_ns: int | None = None
+) -> list[DollarBar]:
     """Read a bar table into ``DollarBar`` objects, oldest first.
 
     Rows without open interest are forward-filled from the last known value (so the replay can
@@ -168,6 +172,10 @@ def bars_from_parquet(path: Path, *, forward_fill_open_interest: bool = True) ->
     if not path.exists():
         return []
     df = pl.read_parquet(path).sort("ts_close_ns")
+    if min_close_ns is not None:
+        df = df.filter(pl.col("ts_close_ns") >= min_close_ns)
+    if max_close_ns is not None:
+        df = df.filter(pl.col("ts_close_ns") <= max_close_ns)
     fields = set(DollarBar.model_fields.keys())
     bars: list[DollarBar] = []
     last_oi: float | None = None
@@ -228,10 +236,13 @@ def load_scenario_bars(
     live: dict[str, list[DollarBar]] = {}
     hourly: dict[str, list[tuple[int, float]]] = {}
     training: list[DollarBar] = []
+    taker_flow = True
+    lookback_ns = scenario.warmup_bars * 4 * STEP_15M_NS + 30 * 96 * STEP_15M_NS
     for coin in scenario.coins:
         norm = normalize_coin_symbol(coin)
         path = (parquet_paths or {}).get(norm, data_dir / f"{norm.lower()}usdt_perp_bars.parquet")
-        bars = bars_from_parquet(path)
+        bars = bars_from_parquet(path, min_close_ns=scenario.start_ns - lookback_ns, max_close_ns=scenario.end_ns)
+        taker_flow = taker_flow and _window_has_taker_flow(path, scenario)
         before = [b for b in bars if b.ts_close_ns <= scenario.start_ns]
         window = [b for b in bars if scenario.start_ns < b.ts_close_ns <= scenario.end_ns]
         history[norm] = before[-scenario.warmup_bars :]
@@ -239,7 +250,23 @@ def load_scenario_bars(
         hourly[norm] = hourly_closes_from_bars(before[-scenario.warmup_bars * 4 :])
         if norm == "BTC":
             training = training_rows_before(path, scenario.start_ns)
-    return ScenarioData(history_by_coin=history, live_by_coin=live, hourly_closes_by_coin=hourly, training_bars=training)
+    return ScenarioData(
+        history_by_coin=history,
+        live_by_coin=live,
+        hourly_closes_by_coin=hourly,
+        training_bars=training,
+        taker_flow_in_bars=taker_flow and any(live.values()),
+    )
+
+
+def _window_has_taker_flow(path: Path, scenario: ReplayScenario) -> bool:
+    if not path.exists():
+        return False
+    df = pl.read_parquet(path, columns=None)
+    if "taker_buy_volume" not in df.columns:
+        return False
+    win = df.filter((pl.col("ts_close_ns") > scenario.start_ns) & (pl.col("ts_close_ns") <= scenario.end_ns))
+    return win.height > 0 and win.get_column("taker_buy_volume").null_count() == 0
 
 
 # ------------------------------------------------------------------------------------------------
@@ -321,6 +348,7 @@ def run_replay(
     primary: str = "BTC",
     max_bars: int | None = None,
     circuit_breakers: CircuitBreakers | None = None,
+    cascade_controller: CascadeController | None = None,
 ) -> ReplayReport:
     """Replay the scenario through the live tick and return (and optionally write) the report."""
     primary_live = data.live_by_coin.get(primary, [])
@@ -358,6 +386,8 @@ def run_replay(
             hrp_seed_hours=len(data.hourly_closes_by_coin.get(primary, [])) or 1,
             fetch_derivatives_inputs=False,
             circuit_breakers=circuit_breakers,
+            cascade_controller=cascade_controller,
+            bars_carry_taker_flow=data.taker_flow_in_bars,
         )
         if starting_capital_usd != 5_000.0:
             store.reset_account(starting_capital_usd=starting_capital_usd)
@@ -436,6 +466,23 @@ def run_replay(
     return report
 
 
+def controls_for(name: str) -> tuple[CircuitBreakers | None, CascadeController]:
+    """``none``: the Phase 0 baseline (no breakers; the cascade controller can never fire). ``phase3``: both on.
+
+    ``breakers`` and ``cascade`` switch on one of the two, to attribute a ``phase3`` difference.
+    """
+    off = CascadeController(CascadeConfig(fragile_conditions=99))
+    if name == "phase3":
+        return CircuitBreakers(), CascadeController()
+    if name == "none":
+        return None, off
+    if name == "breakers":
+        return CircuitBreakers(), off
+    if name == "cascade":
+        return None, CascadeController()
+    raise ValueError(f"unknown controls {name!r}")
+
+
 def summarize(report: ReplayReport) -> str:
     """One-paragraph plain-text summary of a replay report."""
     return (
@@ -457,6 +504,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
     parser.add_argument("--warmup-bars", type=int, default=600)
     parser.add_argument("--max-bars", type=int, default=None)
+    parser.add_argument(
+        "--controls",
+        choices=("none", "phase3", "breakers", "cascade"),
+        default="none",
+        help="none: breakers off, cascade controller disabled (Phase 0 baseline); phase3: both on; breakers or cascade: only that one",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -477,7 +530,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not data.live_by_coin.get("BTC"):
         print(f"No BTC bars for {scenario.name}; run scripts/backfill.py for that window first.")
         return 1
-    report = run_replay(scenario, data, report_dir=args.report_dir, max_bars=args.max_bars)
+    breakers, cascade = controls_for(args.controls)
+    report = run_replay(scenario, data, report_dir=args.report_dir, max_bars=args.max_bars, circuit_breakers=breakers, cascade_controller=cascade)
     print(summarize(report))
     print(json.dumps({k: report.sleeve_attribution[k] for k in report.sleeve_attribution}, indent=2))
     return 0
@@ -487,6 +541,7 @@ __all__ = [
     "DEFAULT_REPORT_DIR",
     "EquityPoint",
     "NAMED_SCENARIOS",
+    "controls_for",
     "ReplayReport",
     "ReplayScenario",
     "ScenarioData",

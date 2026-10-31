@@ -6,7 +6,8 @@ Examples::
     .venv/bin/python scripts/backfill.py --months 12
     .venv/bin/python scripts/backfill.py --start 2025-09-01 --end 2025-10-15 --venues okx --horizons 15m
 
-Candles come from Bybit (primary) or OKX, funding from Hyperliquid, open interest from Bybit or OKX.
+Candles come from Bybit (primary), the Binance public data archive or OKX; funding from Hyperliquid;
+open interest from Bybit, the Binance archive (5-minute, multi-year) or OKX (recent weeks).
 The exit code is 1 when any asset has a gap longer than two bars or no rows at all.
 """
 
@@ -41,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--months", type=int, default=12, help="Window length when --start is not given")
     parser.add_argument("--start", type=str, default=None, help="ISO date/time (UTC)")
     parser.add_argument("--end", type=str, default=None, help="ISO date/time (UTC), default now")
-    parser.add_argument("--venues", default="bybit,okx", help="Candle/OI venue priority, comma separated")
+    parser.add_argument("--venues", default="bybit,binance,okx", help="Candle/OI venue priority, comma separated (binance = public data archive)")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--pause", type=float, default=0.12, help="Seconds between paged requests")
     parser.add_argument("--no-mark-index", action="store_true", help="Fetch trade candles only (mark/spot fall back to close)")
@@ -63,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     venues: list[Venue] = []
     for v in args.venues.split(","):
         v = v.strip().lower()
-        if v in ("bybit", "okx"):
+        if v in ("bybit", "binance", "okx"):
             venues.append(v)
 
     if args.funding_only:

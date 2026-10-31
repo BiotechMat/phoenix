@@ -88,6 +88,7 @@ from core.execution import (
     position_key,
 )
 from core.features import calibrate_optimal_d, compute_positioning_snapshots
+from core.features.candidates import bar_feature_matrix
 from core.execution.markouts import MarkoutTracker
 from core.models.online_residual import OnlineResidualRidge, abstention_threshold, outlier_guard_skip
 from core.fee_tiers import FeeTable, best_hedge_venue, fee_schedule_for, tier_index
@@ -163,13 +164,14 @@ HRP_SEED_HOURS: Final[int] = 480
 FEATURE_WINDOW_BARS: Final[int] = 4096
 UI_WINDOW_BARS: Final[int] = 16
 MIN_TRAIN_LABELLED_BARS: Final[int] = 500
+DEFAULT_META_EXTRA_FEATURES: Final[tuple[str, ...]] = ("momentum_1w", "mark_index_divergence_chg_1h", "nyse_open_flag")
 RETRAIN_INTERVAL_NS: Final[int] = 24 * 3_600 * 1_000_000_000
 DERIVATIVES_INPUT_TTL_NS: Final[int] = 5 * 60 * 1_000_000_000
 WAITING_LOG_INTERVAL_SEC: Final[float] = 60.0
 MAX_GROSS_LEVERAGE: Final[float] = 2.5
 CARRY_TARGET_NOTIONAL_WEIGHT: Final[float] = 0.25
 REAL_BAR_SOURCES: Final[frozenset[str]] = frozenset(
-    {"HYPERLIQUID-L1", "BYBIT-V5-FALLBACK", "SCRIPTED-REAL", "BACKFILL-BYBIT", "BACKFILL-OKX"}
+    {"HYPERLIQUID-L1", "BYBIT-V5-FALLBACK", "SCRIPTED-REAL", "BACKFILL-BYBIT", "BACKFILL-BINANCE", "BACKFILL-OKX"}
 )
 STEP_15M_NS: Final[int] = 900_000_000_000
 
@@ -390,6 +392,8 @@ class ControlCenterStateStore:
         account_volume_14d_usd: float = 0.0,
         staking_discount: float = 0.0,
         shadow_thresholds: Mapping[str, PreRegisteredThresholds] | None = None,
+        bars_carry_taker_flow: bool = False,
+        meta_extra_features: Sequence[str] | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
@@ -424,6 +428,12 @@ class ControlCenterStateStore:
         self._latest_transfer_coefficient: float | None = None
         # Cascade and ADL controls (P3.4): reacts only to inputs that are actually available.
         self._cascade: CascadeController = cascade_controller or CascadeController()
+        # True only when the feed's bars carry venue-reported taker buy/sell volume (archive replays);
+        # live bars without stream coverage hold an even split, which must not be read as flow.
+        self._bars_carry_taker_flow = bars_carry_taker_flow
+        # P2.3: features added to the meta-labeller after passing P1.8 on two non-overlapping years.
+        self._meta_extra_features: tuple[str, ...] = tuple(DEFAULT_META_EXTRA_FEATURES if meta_extra_features is None else meta_extra_features)
+        bar_feature_matrix([], self._meta_extra_features)  # fail fast on a name that needs more than bars
         self._latest_fragility: dict[str, FragilityAssessment] = {}
         self._collateral_haircut: float = 0.0
         # Markout ladder (P4.2): fills scored against Hyperliquid mids from the stream hub.
@@ -816,6 +826,7 @@ class ControlCenterStateStore:
         ffd_cfg = calibrate_optimal_d(log_close, split_id="live_parquet_split")
         snaps = compute_positioning_snapshots(train_bars, close_ffd_config=ffd_cfg)
         x_cont, bin_flags, prim_dirs = extract_continuous_and_binary_from_snapshots(snaps)
+        x_cont = self._with_extra_features(x_cont, train_bars)
 
         labeler = FeeAdjustedTripleBarrierLabeler(self._barrier_cfg)
         labels = labeler.label_bars(train_bars, primary_directions=prim_dirs)
@@ -1306,6 +1317,15 @@ class ControlCenterStateStore:
 
     # ------------------------------------------------------------------ residual layer and abstention (P5.3)
 
+    def _with_extra_features(self, x_cont: np.ndarray, bars: Sequence[DollarBar]) -> np.ndarray:
+        if not self._meta_extra_features:
+            return x_cont
+        return np.column_stack([x_cont, bar_feature_matrix(bars, self._meta_extra_features)])
+
+    @property
+    def meta_feature_names(self) -> list[str]:
+        return ["ffd_close_zscore", "ffd_oi_zscore", "oi_funding_basis_zscore", *self._meta_extra_features]
+
     def _apply_residual_and_abstention(self, meta: MetaPredictionOutput, x_row: np.ndarray) -> MetaPredictionOutput:
         self._predictions_made += 1
         if meta.mahalanobis_di > self._abstain_di:
@@ -1324,6 +1344,7 @@ class ControlCenterStateStore:
             "predictions": self._predictions_made,
             "abstentions": self._abstentions,
             "abstention_rate": (self._abstentions / self._predictions_made) if self._predictions_made else 0.0,
+            "meta_features": self.meta_feature_names,
         }
 
     # ------------------------------------------------------------------ shadow mode (P5.1)
@@ -1447,11 +1468,15 @@ class ControlCenterStateStore:
             flow = self._latest_bar_flows.get(coin)
             a_snap = snap.get_asset(coin)
             depth = a_snap.l2_book.depth_10bps_usd if a_snap is not None and a_snap.l2_book.depth_10bps_usd > 0.0 else None
+            buy: float | None = flow.taker_buy_usd if flow is not None else None
+            sell: float | None = flow.taker_sell_usd if flow is not None else None
+            if flow is None and self._bars_carry_taker_flow:
+                buy, sell = bar.buy_dollar_volume, bar.sell_dollar_volume
             self._cascade.update(
                 coin,
                 ts_ns=ts_ns,
-                taker_buy_usd=flow.taker_buy_usd if flow is not None else None,
-                taker_sell_usd=flow.taker_sell_usd if flow is not None else None,
+                taker_buy_usd=buy,
+                taker_sell_usd=sell,
                 open_interest=bar.open_interest if bar.open_interest > 0.0 else None,
                 funding_rate_1h=bar.funding_rate_1h,
                 depth_10bps_usd=depth,
@@ -2109,6 +2134,7 @@ class ControlCenterStateStore:
         new_pos_sig: PositioningSignalSnapshot = snaps_window[-1]
         x_cont_win, bin_win, _ = extract_continuous_and_binary_from_snapshots(snaps_window)
         features_ok = bool(np.all(np.isfinite(x_cont_win[-1]))) and len(feature_bars) >= 16
+        x_cont_win = self._with_extra_features(x_cont_win, feature_bars)
         if features_ok:
             _run_m1max_metal_gpu_regime_pass(x_cont_win[-1])
 

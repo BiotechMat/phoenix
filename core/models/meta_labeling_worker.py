@@ -645,8 +645,13 @@ class LightGBMMetaLabelWorker:
         sigma_bar_train: Sequence[float] | npt.NDArray[np.float64] | None = None,
         vpin_train: Sequence[float] | npt.NDArray[np.float64] | None = None,
         feature_names: Sequence[str] | None = None,
+        sample_weight: Sequence[float] | npt.NDArray[np.float64] | None = None,
     ) -> LightGBMMetaLabelWorker:
-        """Fit Stage 1 SVD, Mahalanobis Epistemic Gate, and Stage 2 Calibrated LightGBM strictly on train split."""
+        """Fit Stage 1 SVD, Mahalanobis Epistemic Gate, and Stage 2 Calibrated LightGBM strictly on train split.
+
+        ``sample_weight`` (optional, e.g. label uniqueness or recency) weights the Stage 2 classifier and its
+        calibration; the SVD and the outlier gate are fitted unweighted.
+        """
         # 1. Fit Stage 1 Continuous SVD Orthogonalizer (excluding binary liquidation flag)
         svd_train = self.svd_orthogonalizer.fit_transform(
             X_continuous_train,
@@ -661,6 +666,11 @@ class LightGBMMetaLabelWorker:
             )
         if np.any((y_arr != 0) & (y_arr != 1)):
             raise ValueError("y_meta_train labels must be binary in {0, 1}.")
+        sw: npt.NDArray[np.float64] | None = None
+        if sample_weight is not None:
+            sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if sw.shape[0] != n_samples or np.any(~np.isfinite(sw)) or np.any(sw < 0.0):
+                raise ValueError("sample_weight must be finite, non-negative and one per training row")
 
         # 2. Fit Mahalanobis Epistemic Outlier Gate on training continuous SVD factors
         self.outlier_gate.di_threshold = self.di_threshold
@@ -718,10 +728,10 @@ class LightGBMMetaLabelWorker:
                 method=eff_method,
                 cv=cv_folds,
             )
-            cal_lgbm.fit(x_stage2, y_arr)
+            cal_lgbm.fit(x_stage2, y_arr, sample_weight=sw)
             self._lgbm_model = cal_lgbm
         else:
-            base_lgbm.fit(x_stage2, y_arr)
+            base_lgbm.fit(x_stage2, y_arr, sample_weight=sw)
             self._lgbm_model = base_lgbm
 
         if self.use_xgboost_ensemble:

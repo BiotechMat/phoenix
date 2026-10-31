@@ -13,8 +13,9 @@ time. Each asset's net return stream is validated with CPCV through the trial re
 2024 window against an 11-day funding-inversion bound taken from the worst 11 days in the sample.
 
 Limits: the premium index is Hyperliquid's sampled premium, a proxy for the executable perp-spot basis;
-the spot leg's fee uses the perp maker rate; open interest is unavailable historically, so the crowding
-cut uses funding only.
+the spot leg's fee uses the perp maker rate. The crowding cut's open-interest percentile comes from the
+Binance archive's hourly open interest (``data/{coin}usdt_perp_bars_1h.parquet``), ranked against the
+trailing 30 days; without that file the cut falls back to funding alone.
 """
 
 from __future__ import annotations
@@ -85,7 +86,43 @@ def _trailing_mean(rates: NDArray[np.float64], hours: NDArray[np.float64], windo
     return out
 
 
-def simulate(settlements: Sequence[FundingSettlement], rule: Literal["v1", "v2"], config: CarryV2Config | None = None, fee: FeeSchedule | None = None) -> dict[str, NDArray[np.float64]]:
+def rolling_oi_percentile(oi_series: Sequence[tuple[int, float]], query_ms: Sequence[int], window_hours: int = 720) -> NDArray[np.float64]:
+    """Mid-rank percentile of the latest OI at or before each query time within the trailing window (NaN if unknown)."""
+    ts = np.array([t for t, _ in oi_series], dtype=np.int64)
+    vals = np.array([v for _, v in oi_series], dtype=np.float64)
+    out = np.full(len(query_ms), np.nan)
+    win_ms = window_hours * 3_600_000
+    for k, q in enumerate(query_ms):
+        i = int(np.searchsorted(ts, q, side="right")) - 1
+        if i < 0 or q - ts[i] > 2 * 3_600_000:
+            continue
+        j = int(np.searchsorted(ts, ts[i] - win_ms, side="left"))
+        hist = vals[j : i + 1]
+        if hist.size < 24:
+            continue
+        last = vals[i]
+        out[k] = (float(np.sum(hist < last)) + 0.5 * float(np.sum(hist == last))) / hist.size
+    return out
+
+
+def load_hourly_oi(coin: str, data_dir: Path) -> list[tuple[int, float]]:
+    """(bar close ms, open interest) from the 1h bar store, rows with OI only."""
+    import polars as pl
+
+    path = data_dir / f"{coin.lower()}usdt_perp_bars_1h.parquet"
+    if not path.exists():
+        return []
+    df = pl.read_parquet(path, columns=["ts_close_ns", "open_interest"]).filter(pl.col("open_interest").is_not_null()).sort("ts_close_ns")
+    return [(int(t) // 1_000_000, float(v)) for t, v in zip(df["ts_close_ns"].to_list(), df["open_interest"].to_list())]
+
+
+def simulate(
+    settlements: Sequence[FundingSettlement],
+    rule: Literal["v1", "v2"],
+    config: CarryV2Config | None = None,
+    fee: FeeSchedule | None = None,
+    oi_percentile: NDArray[np.float64] | None = None,
+) -> dict[str, NDArray[np.float64]]:
     """Per-step size (decided at step i, held to i+1) and the components of net return."""
     cfg = config or CarryV2Config()
     sched = fee or FeeSchedule.hyperliquid()
@@ -105,6 +142,7 @@ def simulate(settlements: Sequence[FundingSettlement], rule: Literal["v1", "v2"]
                 premium=float(prem[i]),
                 funding_per_hour=float(rates[i]),
                 trailing_funding_per_hour=float(trailing[i]),
+                oi_percentile=(None if oi_percentile is None or not np.isfinite(oi_percentile[i]) else float(oi_percentile[i])),
                 config=cfg.model_copy(update={"roundtrip_cost": rt_cost}),
             )
             size[i] = d.size
@@ -153,8 +191,10 @@ def evaluate_asset(
     rule: Literal["v1", "v2"],
     registry: TrialRegistry,
     config: CarryV2Config | None = None,
+    oi_series: Sequence[tuple[int, float]] | None = None,
 ) -> CarryRuleResult:
-    sim = simulate(settlements, rule, config)
+    oi_pct = rolling_oi_percentile(oi_series, [s.t_ms for s in settlements]) if oi_series else None
+    sim = simulate(settlements, rule, config, oi_percentile=oi_pct)
     net = sim["net"]
     size = sim["size"]
     trips = _round_trips(size)
@@ -181,7 +221,7 @@ def evaluate_asset(
         np.where(sim["held"] > 0.0, 1.0, 0.0) + np.where(sim["held"] > 0.0, 0.0, 1e-12),  # unit "position" so CPCV scores the net stream as given
         cpcv=cpcv,
         fee_schedule=zero_fee,
-        parameters={"rule": rule, **(config or CarryV2Config()).model_dump(mode="json")},
+        parameters={"rule": rule, "crowding_oi": bool(oi_series), **(config or CarryV2Config()).model_dump(mode="json")},
         window_start=datetime.fromtimestamp(int(t[0]) / 1000, tz=timezone.utc),
         window_end=datetime.fromtimestamp(int(t[-1]) / 1000, tz=timezone.utc),
         notes="net carry return stream (funding + basis convergence - costs) per settlement",
@@ -244,6 +284,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--cache-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data" / "funding_history")
     parser.add_argument("--registry", type=Path, default=None)
     parser.add_argument("--start", default="2023-06-08", help="Default: first day of hourly settlement")
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data")
+    parser.add_argument("--no-oi", action="store_true", help="Crowding cut on funding alone (the earlier evaluation)")
+    parser.add_argument("--rules", default="v1,v2")
     args = parser.parse_args(list(argv) if argv is not None else None)
     reg = TrialRegistry(args.registry) if args.registry else TrialRegistry()
     start_ms = int(datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -256,13 +299,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             st = fetch_hyperliquid_settlements(coin, start_ms, int(_time.time() * 1000))
             save_settlements(st, path)
         st = [s for s in st if s.t_ms >= start_ms]
-        for rule in ("v1", "v2"):
-            results.append(evaluate_asset(coin, st, rule, reg))
+        oi = [] if args.no_oi else load_hourly_oi(coin, args.data_dir)
+        for rule in [r.strip() for r in args.rules.split(",") if r.strip() in ("v1", "v2")]:
+            results.append(evaluate_asset(coin, st, rule, reg, oi_series=oi or None))
     print(summarize(results))
     return 0
 
 
-__all__ = ["CarryRuleResult", "evaluate_asset", "inversion_bound", "simulate", "summarize"]
+__all__ = ["CarryRuleResult", "evaluate_asset", "inversion_bound", "load_hourly_oi", "rolling_oi_percentile", "simulate", "summarize"]
 
 
 if __name__ == "__main__":

@@ -19,6 +19,9 @@ from data.backfill_storage import (
     coverage_report,
     merge_into_parquet,
     parquet_path_for,
+    parse_binance_vision_klines,
+    parse_binance_vision_metrics,
+    parse_binance_vision_price_klines,
     parse_bybit_klines,
     parse_bybit_open_interest,
     parse_bybit_price_klines,
@@ -158,3 +161,48 @@ def test_live_backfill_two_days_of_btc_1h_from_okx_and_hyperliquid(tmp_path: Pat
     assert rep.funding_rows > 0  # Hyperliquid funding attached
     assert (tmp_path / "btcusdt_perp_bars_1h.parquet").exists()
     assert df.get_column("mark_price").to_list() != df.get_column("close").to_list()  # real mark prices
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_binance_archive_parsers_on_recorded_files() -> None:
+    candles = parse_binance_vision_klines((FIXTURES / "binance_vision_klines_btc_15m.csv").read_text())
+    assert [c.t_ms for c in candles] == [1722470400000, 1722471300000, 1722472200000]
+    assert candles[0].close == 64638.70 and candles[0].quote_volume == pytest.approx(152678202.3083)
+    assert candles[0].taker_buy_quote == pytest.approx(89359576.9442) and candles[0].n_trades == 30517
+    old = parse_binance_vision_klines((FIXTURES / "binance_vision_klines_btc_15m_headerless.csv").read_text())
+    assert [c.t_ms for c in old] == [1622505600000, 1622506500000]  # 2021 files have no header row
+    marks = parse_binance_vision_price_klines((FIXTURES / "binance_vision_mark_btc_15m.csv").read_text())
+    assert marks[0] == (1722470400000, 64630.3)
+    oi = parse_binance_vision_metrics((FIXTURES / "binance_vision_metrics_btc.csv").read_text())
+    assert oi[0] == (int(datetime(2025, 10, 10, tzinfo=timezone.utc).timestamp() * 1000), 96714.499)
+    assert [t for t, _ in oi] == sorted(t for t, _ in oi) and len(oi) == 3
+
+
+def test_assemble_bars_uses_real_taker_flow_when_the_venue_reports_it() -> None:
+    candles = parse_binance_vision_klines((FIXTURES / "binance_vision_klines_btc_15m.csv").read_text())
+    df = assemble_bars("BTC", "15m", candles, candle_source="binance")
+    row = df.row(0, named=True)
+    assert row["buy_dollar_volume"] == pytest.approx(89359576.9442)
+    assert row["sell_dollar_volume"] == pytest.approx(152678202.3083 - 89359576.9442)
+    assert row["taker_buy_volume"] == pytest.approx(89359576.9442)
+    assert "taker_flow" not in row["fields_unavailable"] and "liquidations" in row["fields_unavailable"]
+    assert row["bar_source"] == "BACKFILL-BINANCE"
+
+
+def test_live_backfill_from_the_binance_archive(tmp_path: Path) -> None:
+    """Live smoke: two days of BTC 1h bars with archive OI and taker flow; skipped when the network is unavailable."""
+    start = datetime(2024, 8, 4, tzinfo=timezone.utc)
+    end = start + timedelta(days=2)
+    try:
+        df, rep = backfill_asset("BTC", "1h", int(start.timestamp() * 1000), int(end.timestamp() * 1000), data_dir=tmp_path, venues=("binance",))
+    except (urllib.error.URLError, OSError) as exc:  # pragma: no cover - network dependent
+        pytest.skip(f"network unavailable: {exc}")
+    if rep.rows == 0:  # pragma: no cover - network dependent
+        pytest.skip("Binance archive unreachable from this network")
+    assert rep.rows >= 48 and rep.passes_gap_rule, rep.as_dict()
+    assert rep.candle_source == "BACKFILL-BINANCE" and rep.oi_source == "BINANCE"
+    assert rep.oi_rows >= 48 and rep.funding_rows > 0
+    assert df.get_column("taker_buy_volume").null_count() == 0
+    assert df.get_column("mark_price").to_list() != df.get_column("close").to_list()

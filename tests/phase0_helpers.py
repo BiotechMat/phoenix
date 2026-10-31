@@ -211,6 +211,7 @@ def build_store(
     carry_sleeve: FundingCarrySleeve | None = None,
     ledger_name: str = "ledger.json",
     parquet_name: str = "bars.parquet",
+    **store_kwargs: Any,
 ) -> ControlCenterStateStore:
     """Construct a store on a scripted feed with isolated ledger and Parquet paths (no network)."""
     feed = ScriptedBarFeed(
@@ -227,6 +228,7 @@ def build_store(
         derivatives_sleeve=derivatives_sleeve or ForcedSignalDerivativesSleeve(direction=0),
         carry_sleeve=carry_sleeve,
         fetch_derivatives_inputs=False,
+        **store_kwargs,
     )
 
 

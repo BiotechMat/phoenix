@@ -14,6 +14,7 @@ from research.replay import (
     NAMED_SCENARIOS,
     ReplayScenario,
     ScenarioData,
+    controls_for,
     hourly_closes_from_bars,
     load_scenario_bars,
     run_replay,
@@ -125,3 +126,31 @@ def test_run_replay_with_no_signal_changes_nothing(tmp_path: Path) -> None:
     assert report.final_equity_usd == report.starting_capital_usd
     assert report.report_path is None
     assert all(pt.open_positions == 0 for pt in report.equity_curve)
+
+
+def test_scenario_reports_taker_flow_only_when_every_window_row_has_it(tmp_path: Path) -> None:
+    history = sine_history("BTC", 120, 100.0)
+    live = ohlc_path("BTC", barrier_path_steps())
+    rows = [dict(b.model_dump(), bar_source="BACKFILL-BINANCE", taker_buy_volume=b.dollar_volume * 0.6) for b in history + live]
+    path = tmp_path / "btcusdt_perp_bars.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    sc = _scenario_for(live_bars=len(live), history_bars=100).model_copy(update={"coins": ("BTC",)})
+    assert load_scenario_bars(sc, tmp_path).taker_flow_in_bars is True
+    rows[-1]["taker_buy_volume"] = None
+    pl.DataFrame(rows).write_parquet(path)
+    assert load_scenario_bars(sc, tmp_path).taker_flow_in_bars is False
+
+
+def test_controls_baseline_never_fragile_and_phase3_turns_both_on() -> None:
+    breakers, cascade = controls_for("none")
+    assert breakers is None
+    for i in range(200):  # OI at highs and funding above 25% a year: two conditions
+        cascade.update("BTC", ts_ns=i, taker_buy_usd=None, taker_sell_usd=None, open_interest=100.0 + i, funding_rate_1h=0.0001, depth_10bps_usd=None)
+    assert cascade.assess("BTC", 200).fragile is False
+    breakers3, cascade3 = controls_for("phase3")
+    assert breakers3 is not None
+    for i in range(200):
+        cascade3.update("BTC", ts_ns=i, taker_buy_usd=None, taker_sell_usd=None, open_interest=100.0 + i, funding_rate_1h=0.0001, depth_10bps_usd=None)
+    assert cascade3.assess("BTC", 200).fragile is True
+    with pytest.raises(ValueError):
+        controls_for("other")

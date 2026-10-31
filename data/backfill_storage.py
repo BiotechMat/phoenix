@@ -10,8 +10,12 @@ Sources, all real:
   carry sleeve trades, so its funding is the one that matters for labels and carry PnL.
 - Open interest: Bybit ``open-interest`` history (primary, multi-year) or OKX
   ``open-interest-history`` (recent weeks only).
-- Liquidations and taker buy volume: no history feed yet (P1.1 / P1.3). The columns are ``0.0`` and
-  ``null`` respectively and ``fields_unavailable`` names them.
+- Binance public data archive (``data.binance.vision``, venue ``binance``): monthly and daily USD-M
+  futures klines with taker buy volume, mark and index price klines, and 5-minute open interest from the
+  daily ``metrics`` files back to December 2021. It is plain file hosting, so it answers where the
+  Binance and Bybit REST APIs refuse requests. Bars from it carry real taker buy/sell dollar volume.
+- Liquidations: no history feed (P1.3 streams them live). The column is ``0.0`` and
+  ``fields_unavailable`` names it; taker flow is also listed there when the candle venue has none.
 
 Nothing is synthesised. A bar whose open interest is unknown carries ``null`` and is excluded from
 model training by the live loop's Parquet loader.
@@ -24,11 +28,16 @@ from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+import csv
+import io
 import time
 from typing import Any, Final, Literal
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 import numpy as np
 import polars as pl
@@ -94,7 +103,7 @@ EXTRA_COLUMNS: tuple[str, ...] = (
 )
 
 Horizon = Literal["15m", "1h"]
-Venue = Literal["bybit", "okx"]
+Venue = Literal["bybit", "binance", "okx"]
 
 HORIZON_MS: Final[dict[str, int]] = {"15m": 900_000, "1h": 3_600_000}
 BYBIT_INTERVAL: Final[dict[str, str]] = {"15m": "15", "1h": "60"}
@@ -105,6 +114,8 @@ OKX_OI_PERIOD: Final[dict[str, str]] = {"15m": "15m", "1h": "1H"}
 BYBIT_BASE_URL: Final[str] = "https://api.bybit.com/v5/market"
 OKX_BASE_URL: Final[str] = "https://www.okx.com/api/v5"
 HYPERLIQUID_INFO_URL: Final[str] = "https://api.hyperliquid.xyz/info"
+BINANCE_VISION_URL: Final[str] = "https://data.binance.vision/data/futures/um"
+BINANCE_VISION_WORKERS: Final[int] = 8
 
 BYBIT_PAGE_LIMIT: Final[int] = 1000
 BYBIT_OI_PAGE_LIMIT: Final[int] = 200
@@ -128,6 +139,7 @@ class Candle:
     volume_base: float
     quote_volume: float
     n_trades: int | None = None
+    taker_buy_quote: float | None = None
 
 
 @dataclass(frozen=True)
@@ -291,6 +303,61 @@ def parse_bybit_open_interest(rows: Sequence[Mapping[str, Any]]) -> list[tuple[i
 def parse_okx_open_interest(rows: Sequence[Sequence[Any]]) -> list[tuple[int, float]]:
     """OKX open-interest-history rows ``[ts, oi_contracts, oi_ccy, oi_usd]`` -> ``(t_ms, oi_base)``."""
     out = [(int(r[0]), float(r[2])) for r in rows if len(r) >= 3]
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _vision_rows(text: str) -> list[list[str]]:
+    """CSV rows of an archive file without its header (older files have none)."""
+    rows = [r for r in csv.reader(io.StringIO(text)) if r]
+    if rows and not rows[0][0].strip().lstrip("-").replace(".", "", 1).isdigit():
+        rows = rows[1:]
+    return rows
+
+
+def _ms(value: str) -> int:
+    t = int(float(value))
+    return t // 1000 if t > 10**14 else t  # some archive files use microseconds
+
+
+def parse_binance_vision_klines(text: str) -> list[Candle]:
+    """Archive kline CSV ``open_time, o, h, l, c, volume, close_time, quote_volume, count,
+    taker_buy_volume, taker_buy_quote_volume, ignore`` -> candles with taker buy quote volume."""
+    out: list[Candle] = []
+    for r in _vision_rows(text):
+        if len(r) < 11:
+            continue
+        out.append(
+            Candle(
+                t_ms=_ms(r[0]), open=float(r[1]), high=float(r[2]), low=float(r[3]), close=float(r[4]),
+                volume_base=float(r[5]), quote_volume=float(r[7]), n_trades=int(float(r[8])), taker_buy_quote=float(r[10]),
+            )
+        )
+    out.sort(key=lambda c: c.t_ms)
+    return out
+
+
+def parse_binance_vision_price_klines(text: str) -> list[tuple[int, float]]:
+    """Archive mark or index price kline CSV -> ``(t_ms, close)``."""
+    out = [(_ms(r[0]), float(r[4])) for r in _vision_rows(text) if len(r) >= 5]
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def parse_binance_vision_metrics(text: str) -> list[tuple[int, float]]:
+    """Archive ``metrics`` CSV (5-minute ``create_time, symbol, sum_open_interest, ...``) -> ``(t_ms, oi_base)``.
+
+    ``create_time`` is the end of the 5-minute window, so the value is known at that time.
+    """
+    out: list[tuple[int, float]] = []
+    for r in _vision_rows(text):
+        if len(r) < 3 or not r[2]:
+            continue
+        try:
+            ts = datetime.strptime(r[0].strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            out.append((int(ts.timestamp() * 1000), float(r[2])))
+        except ValueError:
+            continue
     out.sort(key=lambda x: x[0])
     return out
 
@@ -473,6 +540,105 @@ def fetch_okx_open_interest(
     return [(t, oi) for t, oi in parse_okx_open_interest(rows) if start_ms <= t <= end_ms]
 
 
+def _http_get_zip_text(url: str, timeout_sec: float = 30.0, max_retries: int = 4) -> str | None:
+    """Text of the single CSV inside an archive zip; ``None`` when the file does not exist (404)."""
+    delay = 2.0
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": "ProjectPhoenix/4.1"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                payload = resp.read()
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                names = [n for n in zf.namelist() if n.endswith(".csv")]
+                return zf.read(names[0]).decode("utf-8") if names else None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            if attempt >= max_retries or not (exc.code == 429 or exc.code >= 500):
+                raise
+        except (urllib.error.URLError, TimeoutError, zipfile.BadZipFile):
+            if attempt >= max_retries:
+                raise
+        time.sleep(delay)
+        delay = min(delay * 2.0, 30.0)
+    return None
+
+
+def _months(start: date, end: date) -> list[date]:
+    out: list[date] = []
+    cur = date(start.year, start.month, 1)
+    while cur <= end:
+        out.append(cur)
+        cur = date(cur.year + (cur.month == 12), cur.month % 12 + 1, 1)
+    return out
+
+
+def _vision_kline_urls(kind: str, symbol: str, interval: str, start_ms: int, end_ms: int, base_url: str) -> list[str]:
+    """Monthly files for complete past months, daily files for the current (unpublished) month."""
+    start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+    end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).date()
+    this_month = date(end.year, end.month, 1)
+    urls: list[str] = []
+    for m in _months(start, end):
+        if m < this_month:
+            urls.append(f"{base_url}/monthly/{kind}/{symbol}/{interval}/{symbol}-{interval}-{m:%Y-%m}.zip")
+        else:
+            d = max(m, start)
+            while d <= end:
+                urls.append(f"{base_url}/daily/{kind}/{symbol}/{interval}/{symbol}-{interval}-{d:%Y-%m-%d}.zip")
+                d += timedelta(days=1)
+    return urls
+
+
+def _fetch_many(urls: Sequence[str], timeout_sec: float) -> list[str]:
+    with ThreadPoolExecutor(max_workers=BINANCE_VISION_WORKERS) as pool:
+        texts = list(pool.map(lambda u: _http_get_zip_text(u, timeout_sec=timeout_sec), urls))
+    missing = [u for u, t in zip(urls, texts) if t is None]
+    if missing:
+        logger.info("Binance archive: %d of %d files not published (e.g. %s)", len(missing), len(urls), missing[0])
+    return [t for t in texts if t is not None]
+
+
+def fetch_binance_vision_klines(
+    symbol: str,
+    horizon: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    kind: str = "klines",
+    base_url: str = BINANCE_VISION_URL,
+    timeout_sec: float = 30.0,
+) -> list[str]:
+    """Raw CSV texts of archive ``klines`` / ``markPriceKlines`` / ``indexPriceKlines`` covering the window.
+
+    ``horizon`` is the archive interval (``1m``, ``15m``, ``1h``, ...).
+    """
+    return _fetch_many(_vision_kline_urls(kind, symbol, horizon, start_ms, end_ms, base_url), timeout_sec)
+
+
+def fetch_binance_vision_open_interest(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    base_url: str = BINANCE_VISION_URL,
+    timeout_sec: float = 30.0,
+) -> list[tuple[int, float]]:
+    """5-minute open interest (base units) from the daily ``metrics`` archive, oldest first."""
+    start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+    end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).date()
+    urls: list[str] = []
+    d = start
+    while d <= end:
+        urls.append(f"{base_url}/daily/metrics/{symbol}/{symbol}-metrics-{d:%Y-%m-%d}.zip")
+        d += timedelta(days=1)
+    series: list[tuple[int, float]] = []
+    for text in _fetch_many(urls, timeout_sec):
+        series.extend(parse_binance_vision_metrics(text))
+    series.sort(key=lambda x: x[0])
+    return [(t, v) for t, v in series if start_ms <= t <= end_ms + 3_600_000]
+
+
 def fetch_hyperliquid_funding(
     coin: str,
     start_ms: int,
@@ -625,7 +791,9 @@ def assemble_bars(
       exists within two bar lengths.
     - ``mark_price`` / ``spot_price`` come from mark and index candles for the same bar when
       available, otherwise the close (listed in ``fields_unavailable``).
-    - ``buy_dollar_volume`` / ``sell_dollar_volume`` are an even split; ``taker_buy_volume`` is null.
+    - ``buy_dollar_volume`` / ``sell_dollar_volume`` and ``taker_buy_volume`` come from the candle venue's
+      taker buy volume when it reports one (Binance archive); otherwise an even split, ``null`` and
+      ``taker_flow`` listed as unavailable.
     - ``liquidation_volume_usd`` is ``0.0`` and listed as unavailable.
     """
     step_ms = HORIZON_MS[horizon]
@@ -643,7 +811,8 @@ def assemble_bars(
     mark = _causal_values(mark_closes, t_open, max_staleness_ms=0) if mark_closes else np.full(n, np.nan)
     index = _causal_values(index_closes, t_open, max_staleness_ms=0) if index_closes else np.full(n, np.nan)
 
-    missing: list[str] = ["taker_flow", "liquidations"]
+    has_taker = n > 0 and all(c.taker_buy_quote is not None for c in cands)
+    missing: list[str] = ["liquidations"] if has_taker else ["taker_flow", "liquidations"]
     if not mark_closes:
         missing.append("mark_price")
     if not index_closes:
@@ -656,6 +825,12 @@ def assemble_bars(
     index_filled = np.where(np.isnan(index), closes, index)
     volumes = np.array([c.volume_base for c in cands], dtype=np.float64)
     dvol = np.array([c.quote_volume if c.quote_volume > 0.0 else c.volume_base * c.close for c in cands], dtype=np.float64)
+    if has_taker:
+        buy = np.clip(np.array([float(c.taker_buy_quote or 0.0) for c in cands], dtype=np.float64), 0.0, dvol)
+        taker_col: list[float | None] = buy.tolist()
+    else:
+        buy = dvol * 0.5
+        taker_col = [None] * n
 
     df = pl.DataFrame(
         {
@@ -669,8 +844,8 @@ def assemble_bars(
             "close": closes.tolist(),
             "volume": volumes.tolist(),
             "dollar_volume": dvol.tolist(),
-            "buy_dollar_volume": (dvol * 0.5).tolist(),
-            "sell_dollar_volume": (dvol * 0.5).tolist(),
+            "buy_dollar_volume": buy.tolist(),
+            "sell_dollar_volume": (dvol - buy).tolist(),
             "open_interest": [None if np.isnan(v) else float(v) for v in oi],
             "funding_rate_8h": (funding_1h * 8.0).tolist(),
             "mark_price": mark_filled.tolist(),
@@ -678,7 +853,7 @@ def assemble_bars(
             "liquidation_volume_usd": [0.0] * n,
             "tick_count": [int(c.n_trades) if c.n_trades is not None and c.n_trades > 0 else 1 for c in cands],
             "funding_rate_1h": funding_1h.tolist(),
-            "taker_buy_volume": [None] * n,
+            "taker_buy_volume": taker_col,
             "bar_source": [f"BACKFILL-{candle_source.upper()}" if candle_source else "BACKFILL"] * n,
             "oi_source": [oi_source.upper() if oi_source else ""] * n,
             "fields_unavailable": [unavailable_tag] * n,
@@ -782,7 +957,7 @@ def fetch_candle_bundle(
     start_ms: int,
     end_ms: int,
     *,
-    venues: Sequence[Venue] = ("bybit", "okx"),
+    venues: Sequence[Venue] = ("bybit", "binance", "okx"),
     pause_sec: float = DEFAULT_PAUSE_SEC,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     include_mark_index: bool = True,
@@ -805,6 +980,17 @@ def fetch_candle_bundle(
                 marks = parse_bybit_price_klines(fetch_bybit_klines(sym, horizon, start_ms, end_ms, kind="mark-price-kline", pause_sec=pause_sec, timeout_sec=timeout_sec))
                 index = parse_bybit_price_klines(fetch_bybit_klines(sym, horizon, start_ms, end_ms, kind="index-price-kline", pause_sec=pause_sec, timeout_sec=timeout_sec))
                 return candles, marks, index, "bybit"
+            if venue == "binance":
+                sym = _bybit_symbol(coin)
+                candles = [c for t in fetch_binance_vision_klines(sym, horizon, start_ms, end_ms, timeout_sec=max(timeout_sec, 30.0)) for c in parse_binance_vision_klines(t)]
+                candles = sorted({c.t_ms: c for c in candles if start_ms <= c.t_ms <= end_ms}.values(), key=lambda c: c.t_ms)
+                if not candles:
+                    continue
+                if not include_mark_index:
+                    return candles, [], [], "binance"
+                marks = [x for t in fetch_binance_vision_klines(sym, horizon, start_ms, end_ms, kind="markPriceKlines") for x in parse_binance_vision_price_klines(t)]
+                index = [x for t in fetch_binance_vision_klines(sym, horizon, start_ms, end_ms, kind="indexPriceKlines") for x in parse_binance_vision_price_klines(t)]
+                return candles, sorted(set(marks)), sorted(set(index)), "binance"
             if venue == "okx":
                 candles = parse_okx_candles(fetch_okx_candles(_okx_swap(coin), horizon, start_ms, end_ms, pause_sec=pause_sec, timeout_sec=timeout_sec))
                 if not candles:
@@ -828,7 +1014,7 @@ def fetch_open_interest_bundle(
     start_ms: int,
     end_ms: int,
     *,
-    venues: Sequence[Venue] = ("bybit", "okx"),
+    venues: Sequence[Venue] = ("bybit", "binance", "okx"),
     pause_sec: float = DEFAULT_PAUSE_SEC,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
 ) -> tuple[list[tuple[int, float]], str]:
@@ -837,6 +1023,8 @@ def fetch_open_interest_bundle(
         try:
             if venue == "bybit":
                 series = fetch_bybit_open_interest(_bybit_symbol(coin), horizon, start_ms, end_ms, pause_sec=pause_sec, timeout_sec=timeout_sec)
+            elif venue == "binance":
+                series = fetch_binance_vision_open_interest(_bybit_symbol(coin), start_ms, end_ms)
             else:
                 series = fetch_okx_open_interest(_okx_swap(coin), horizon, start_ms, end_ms, pause_sec=pause_sec, timeout_sec=timeout_sec)
             if series:
@@ -853,7 +1041,7 @@ def backfill_asset(
     end_ms: int,
     *,
     data_dir: Path = DATA_DIR,
-    venues: Sequence[Venue] = ("bybit", "okx"),
+    venues: Sequence[Venue] = ("bybit", "binance", "okx"),
     pause_sec: float = DEFAULT_PAUSE_SEC,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     write: bool = True,
@@ -931,7 +1119,7 @@ def run_backfill(
     start_ms: int,
     end_ms: int,
     data_dir: Path = DATA_DIR,
-    venues: Sequence[Venue] = ("bybit", "okx"),
+    venues: Sequence[Venue] = ("bybit", "binance", "okx"),
     pause_sec: float = DEFAULT_PAUSE_SEC,
     include_mark_index: bool = True,
     include_open_interest: bool = True,
@@ -965,6 +1153,8 @@ __all__ = [
     "coverage_report",
     "fetch_bybit_klines",
     "FundingSettlement",
+    "fetch_binance_vision_klines",
+    "fetch_binance_vision_open_interest",
     "fetch_bybit_open_interest",
     "fetch_hyperliquid_settlements",
     "load_settlements",
@@ -976,6 +1166,9 @@ __all__ = [
     "fetch_open_interest_bundle",
     "merge_into_parquet",
     "parquet_path_for",
+    "parse_binance_vision_klines",
+    "parse_binance_vision_metrics",
+    "parse_binance_vision_price_klines",
     "parse_bybit_klines",
     "parse_bybit_open_interest",
     "parse_bybit_price_klines",

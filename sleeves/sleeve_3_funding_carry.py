@@ -810,6 +810,7 @@ class CarryV2Config(BaseModel):
     trailing_hours: int = Field(default=72, ge=1)
     min_instant_funding_per_hour: float = Field(default=-0.01 / 24.0, description="Hard exit below -1% per day")
     crowded_funding_annual: float = Field(default=0.25, gt=0.0)
+    crowded_oi_percentile: float = Field(default=0.90, gt=0.0, lt=1.0)
     crowded_size: float = Field(default=0.5, gt=0.0, le=1.0)
 
     @property
@@ -840,18 +841,22 @@ def carry_v2_decide(
     funding_per_hour: float,
     trailing_funding_per_hour: float,
     oi_cap_hit: bool = False,
+    oi_percentile: float | None = None,
     config: CarryV2Config | None = None,
 ) -> CarryV2Decision:
     """One step of the v2 state machine for a spot-long / perp-short carry.
 
     Entry: rho above the cost band and positive trailing (3-day) funding. Exit: rho at or below zero,
-    trailing funding negative, or instantaneous funding below -1% per day. Crowding (annualised funding
-    above 25%, or the asset at its OI cap) halves the size. The plan's extra "rho < 0 for 6 hours" exit
-    is implied by the first exit rule.
+    trailing funding negative, or instantaneous funding below -1% per day. Crowding halves the size:
+    annualised funding above 25% with open interest above its rolling 90th percentile, or the asset at its
+    OI cap. When no OI percentile is supplied (``None``) the funding condition alone decides. The plan's
+    extra "rho < 0 for 6 hours" exit is implied by the first exit rule.
     """
     cfg = config or CarryV2Config()
     rho = compute_deviation_rho(premium, cfg)
-    crowded = funding_per_hour * 8760.0 > cfg.crowded_funding_annual or oi_cap_hit
+    hot_funding = funding_per_hour * 8760.0 > cfg.crowded_funding_annual
+    oi_high = True if oi_percentile is None else oi_percentile > cfg.crowded_oi_percentile
+    crowded = (hot_funding and oi_high) or oi_cap_hit
     size = cfg.crowded_size if crowded else 1.0
     if in_position:
         if rho <= 0.0:
