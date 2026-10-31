@@ -74,7 +74,7 @@ def test_unvalidated_derivatives_sleeve_trades_in_the_shadow_book(tmp_path: Path
     shadow_closed = store.shadow_positions.closed_trades
     assert [t.exit_reason for t in shadow_closed] == [PositionExitReason.PROFIT_BARRIER, PositionExitReason.STOP_BARRIER, PositionExitReason.VERTICAL_EXPIRY]
     tele = store.shadow_telemetry
-    assert tele["sleeves"] == ["derivatives_alpha"]
+    assert tele["sleeves"] == ["derivatives_alpha", "meta_labeller_challenger"]  # the P2.3 challenger also runs in shadow
     assert tele["status"]["derivatives_alpha"]["trades"] == 3 and tele["status"]["derivatives_alpha"]["state"] == "SHADOW"
 
 

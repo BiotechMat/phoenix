@@ -148,3 +148,30 @@ def test_store_trains_and_predicts_with_extra_features(tmp_path: object) -> None
     assert store.residual_telemetry["meta_features"][-2:] == ["momentum_1w", "mark_index_divergence_chg_1h"]
     store.step_simulation_tick()
     assert 0.0 < store.state.meta_predictions[-1].p_meta < 1.0
+
+
+def test_challenger_is_fitted_and_trades_only_in_the_shadow_book(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from core.contracts import DataAvailability
+    from tests.phase0_helpers import build_store, companion_flat_bars, make_snapshot, ohlc_path
+    from ui.api_server import DEFAULT_META_CHALLENGER_FEATURES, MIN_TRAIN_LABELLED_BARS, SLEEVE_META_CHALLENGER
+
+    history = sine_history("BTC", MIN_TRAIN_LABELLED_BARS + 800, 100.0)
+    live = ohlc_path("BTC", [(100.0, 100.3, 99.7, 100.2), (100.2, 100.5, 99.9, 100.1)])
+    store = build_store(
+        Path(str(tmp_path)),
+        live_bars={"BTC": live, **companion_flat_bars(2)},
+        snapshots=[make_snapshot()],
+        history={"BTC": history},
+        availability=DataAvailability(candles=True, funding_history=True, open_interest_history=True, feed_source="SCRIPTED"),
+    )
+    tele = store.residual_telemetry
+    assert tele["meta_features"] == ["ffd_close_zscore", "ffd_oi_zscore", "oi_funding_basis_zscore"]  # live model unchanged
+    assert tele["challenger_features"] == list(DEFAULT_META_CHALLENGER_FEATURES) and tele["challenger_fitted"] is True
+    assert SLEEVE_META_CHALLENGER in store.shadow_sleeve_ids
+    store.step_simulation_tick()
+    store.step_simulation_tick()
+    assert store.residual_telemetry["challenger_p_meta"] is not None
+    assert all(p.sleeve_id != SLEEVE_META_CHALLENGER for p in store.position_manager.open_positions.values())
+    assert all(t.sleeve_id != SLEEVE_META_CHALLENGER for t in store.position_manager.closed_trades)

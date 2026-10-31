@@ -164,7 +164,10 @@ HRP_SEED_HOURS: Final[int] = 480
 FEATURE_WINDOW_BARS: Final[int] = 4096
 UI_WINDOW_BARS: Final[int] = 16
 MIN_TRAIN_LABELLED_BARS: Final[int] = 500
-DEFAULT_META_EXTRA_FEATURES: Final[tuple[str, ...]] = ("momentum_1w", "mark_index_divergence_chg_1h", "nyse_open_flag")
+DEFAULT_META_EXTRA_FEATURES: Final[tuple[str, ...]] = ()
+# P2.3 features that passed P1.8 on two non-overlapping years; they run as a shadow challenger (P5.1) first.
+DEFAULT_META_CHALLENGER_FEATURES: Final[tuple[str, ...]] = ("momentum_1w", "mark_index_divergence_chg_1h", "nyse_open_flag")
+SLEEVE_META_CHALLENGER: Final[str] = "meta_labeller_challenger"
 RETRAIN_INTERVAL_NS: Final[int] = 24 * 3_600 * 1_000_000_000
 DERIVATIVES_INPUT_TTL_NS: Final[int] = 5 * 60 * 1_000_000_000
 WAITING_LOG_INTERVAL_SEC: Final[float] = 60.0
@@ -394,6 +397,7 @@ class ControlCenterStateStore:
         shadow_thresholds: Mapping[str, PreRegisteredThresholds] | None = None,
         bars_carry_taker_flow: bool = False,
         meta_extra_features: Sequence[str] | None = None,
+        meta_challenger_features: Sequence[str] | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
@@ -431,9 +435,15 @@ class ControlCenterStateStore:
         # True only when the feed's bars carry venue-reported taker buy/sell volume (archive replays);
         # live bars without stream coverage hold an even split, which must not be read as flow.
         self._bars_carry_taker_flow = bars_carry_taker_flow
-        # P2.3: features added to the meta-labeller after passing P1.8 on two non-overlapping years.
+        # P2.3: extra meta-labeller features for the live model (none by default) and for a challenger model
+        # that trades only in the shadow book until it completes the P5.1 workflow.
         self._meta_extra_features: tuple[str, ...] = tuple(DEFAULT_META_EXTRA_FEATURES if meta_extra_features is None else meta_extra_features)
-        bar_feature_matrix([], self._meta_extra_features)  # fail fast on a name that needs more than bars
+        self._meta_challenger_features: tuple[str, ...] = tuple(
+            DEFAULT_META_CHALLENGER_FEATURES if meta_challenger_features is None else meta_challenger_features
+        )
+        bar_feature_matrix([], self._meta_extra_features + self._meta_challenger_features)  # fail fast on a name that needs more than bars
+        self._challenger_worker: LightGBMMetaLabelWorker | None = None
+        self._latest_challenger_meta: MetaPredictionOutput | None = None
         self._latest_fragility: dict[str, FragilityAssessment] = {}
         self._collateral_haircut: float = 0.0
         # Markout ladder (P4.2): fills scored against Hyperliquid mids from the stream hub.
@@ -826,6 +836,7 @@ class ControlCenterStateStore:
         ffd_cfg = calibrate_optimal_d(log_close, split_id="live_parquet_split")
         snaps = compute_positioning_snapshots(train_bars, close_ffd_config=ffd_cfg)
         x_cont, bin_flags, prim_dirs = extract_continuous_and_binary_from_snapshots(snaps)
+        x_base_all = x_cont
         x_cont = self._with_extra_features(x_cont, train_bars)
 
         labeler = FeeAdjustedTripleBarrierLabeler(self._barrier_cfg)
@@ -878,6 +889,7 @@ class ControlCenterStateStore:
             self._residual = None
             self._abstain_di = float("inf")
         self._ffd_close_cfg = ffd_cfg
+        self._fit_challenger(x_base_all, train_bars, n_keep, y_meta, flags_train, sigma_series)
         pos_rate = float(np.mean(y_meta))
         self._last_retrain_message = f"fitted on {n_keep} labelled real bars (positive rate {pos_rate:.1%})"
         return worker
@@ -1317,6 +1329,27 @@ class ControlCenterStateStore:
 
     # ------------------------------------------------------------------ residual layer and abstention (P5.3)
 
+    def _fit_challenger(
+        self, x_base: np.ndarray, bars: Sequence[DollarBar], n_keep: int, y: np.ndarray, flags: np.ndarray, sigma: np.ndarray
+    ) -> None:
+        """Fit the shadow challenger (live features plus ``meta_challenger_features``) on the same rows and labels."""
+        if not self._meta_challenger_features:
+            self._challenger_worker = None
+            return
+        try:
+            x = np.column_stack([x_base, bar_feature_matrix(bars, self._meta_challenger_features)])[:n_keep]
+            worker = LightGBMMetaLabelWorker(di_threshold=3.50, n_jobs=4, fee_schedule=self._fee)
+            worker.fit(x, y, liquidation_exhaustion_flag_train=flags, sigma_bar_train=sigma)
+            self._challenger_worker = worker
+        except Exception as exc:
+            logger.warning("Challenger meta-labeller fit failed (%s); previous challenger retained.", exc)
+
+    def _predict_challenger(self, x_base_win: np.ndarray, feature_bars: Sequence[DollarBar], **kwargs: Any) -> MetaPredictionOutput | None:
+        if self._challenger_worker is None:
+            return None
+        row = np.concatenate([x_base_win[-1], bar_feature_matrix(feature_bars, self._meta_challenger_features)[-1]])
+        return self._challenger_worker.predict_single(x_continuous_row=row, **kwargs)
+
     def _with_extra_features(self, x_cont: np.ndarray, bars: Sequence[DollarBar]) -> np.ndarray:
         if not self._meta_extra_features:
             return x_cont
@@ -1345,6 +1378,9 @@ class ControlCenterStateStore:
             "abstentions": self._abstentions,
             "abstention_rate": (self._abstentions / self._predictions_made) if self._predictions_made else 0.0,
             "meta_features": self.meta_feature_names,
+            "challenger_features": list(self._meta_challenger_features),
+            "challenger_fitted": self._challenger_worker is not None,
+            "challenger_p_meta": None if self._latest_challenger_meta is None else self._latest_challenger_meta.p_meta,
         }
 
     # ------------------------------------------------------------------ shadow mode (P5.1)
@@ -1356,6 +1392,8 @@ class ControlCenterStateStore:
             ids.add(SLEEVE_DERIVATIVES)
         if self._trend_sleeve.enabled and self._trend_sleeve.config.shadow:
             ids.add(TREND_SLEEVE_ID)
+        if self._meta_challenger_features:
+            ids.add(SLEEVE_META_CHALLENGER)  # never live from here: promotion is a configuration change
         return ids
 
     def _step_shadow_book(self, bar_index: int, ts_ns: int, marks: Mapping[str, BarMarks], regime_veto: bool, sigma_bar: float) -> None:
@@ -1786,6 +1824,24 @@ class ControlCenterStateStore:
                 f"DI={meta.mahalanobis_di:.2f} (gate {'open' if meta.epistemic_gate_passed else 'closed'})"
             ),
         )
+        ch = self._latest_challenger_meta
+        if ch is not None:
+            ch_expected = (ch.p_meta * ub - (1.0 - ch.p_meta) * lb) * 10_000.0 - self._impact_bps("BTC", hrp["BTC"], sigma_bar)
+            ch_alloc = compute_signed_target_weights(
+                [AssetAllocationInput(asset_id="BTC", y_primary=ch.effective_direction, w_hrp=hrp["BTC"], p_meta=ch.p_meta,
+                                      expected_gross_return_bps=ch_expected, fee_schedule=self._fee, epistemic_gate_passed=ch.epistemic_gate_passed)],
+                regime_multiplier=directional_m,
+                max_gross_leverage=MAX_GROSS_LEVERAGE,
+            )
+            targets[position_key(SLEEVE_META_CHALLENGER, "BTC")] = SleeveTarget(
+                sleeve_id=SLEEVE_META_CHALLENGER,
+                asset="BTC",
+                weight=ch_alloc.weights.get("BTC", 0.0),
+                hedged=False,
+                p_meta=ch.p_meta,
+                expected_gross_return_bps=ch_expected,
+                reason=f"challenger (+{', '.join(self._meta_challenger_features)}) p_meta={ch.p_meta:.3f}, direction={ch.effective_direction:+d}",
+            )
         if deriv_alloc is not None:
             for coin, sig in self._latest_derivatives_signals.items():
                 targets[position_key(SLEEVE_DERIVATIVES, coin)] = SleeveTarget(
@@ -2134,6 +2190,7 @@ class ControlCenterStateStore:
         new_pos_sig: PositioningSignalSnapshot = snaps_window[-1]
         x_cont_win, bin_win, _ = extract_continuous_and_binary_from_snapshots(snaps_window)
         features_ok = bool(np.all(np.isfinite(x_cont_win[-1]))) and len(feature_bars) >= 16
+        x_base_win = x_cont_win
         x_cont_win = self._with_extra_features(x_cont_win, feature_bars)
         if features_ok:
             _run_m1max_metal_gpu_regime_pass(x_cont_win[-1])
@@ -2163,8 +2220,23 @@ class ControlCenterStateStore:
                 vpin=new_hawkes.vpin,
             )
             new_meta = self._apply_residual_and_abstention(new_meta, x_cont_win[-1])
+            try:
+                self._latest_challenger_meta = self._predict_challenger(
+                    x_base_win,
+                    feature_bars,
+                    instrument_id=s.active_instrument,
+                    ts_close_ns=ts_close,
+                    liquidation_exhaustion_flag=int(bin_win[-1]),
+                    primary_direction=new_pos_sig.primary_direction,
+                    sigma_bar=sigma_bar,
+                    vpin=new_hawkes.vpin,
+                )
+            except Exception as exc:
+                logger.warning("Challenger prediction failed: %s", exc)
+                self._latest_challenger_meta = None
         else:
             new_meta = _neutral_meta_prediction(s.active_instrument, ts_close, self._last_retrain_message)
+            self._latest_challenger_meta = None
 
         # 3. Risk committee from live prices and per-asset funding.
         prices = {coin: (a.mid_price if (a := snap.get_asset(coin)) is not None else hourly_prices[coin]) for coin in ASSETS}
