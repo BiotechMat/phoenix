@@ -111,9 +111,18 @@ from ui import (
 )
 from ui.api_server import (
     AccountLedgerData,
-    ControlCenterStateStore,
     LEDGER_FILE,
     TradeForensicRecord,
+)
+from tests.phase0_helpers import (
+    ForcedSignalDerivativesSleeve,
+    barrier_path_steps,
+    build_store,
+    companion_flat_bars,
+    flat_bars,
+    flat_history,
+    make_snapshot,
+    ohlc_path,
 )
 
 
@@ -798,11 +807,22 @@ def test_web_ui_control_center_telegram_and_layman_docs() -> None:
 
 
 def test_account_ledger_restart_durability(tmp_path: Path) -> None:
-    """Verify ControlCenterStateStore retains $5,000 base capital, accumulated PnL, trades, and win/loss across shutdown & reboot."""
-    test_ledger = tmp_path / "account_ledger.json"
+    """Verify ControlCenterStateStore retains base capital, realised PnL, closed trades, win/loss and open positions across restart.
 
-    # 1. Fresh state initialization asserts $5,000 base capital and creates atomic ledger file
-    store_session_1 = ControlCenterStateStore(ledger_path=test_ledger)
+    Phase 0 change: trades are closed positions, not bars. A scripted price path with a standing
+    long signal closes exactly three trades (profit barrier, stop barrier, vertical expiry) and
+    leaves one re-entered position open, which must survive the restart.
+    """
+    test_ledger = tmp_path / "account_ledger.json"
+    steps = barrier_path_steps()
+    store_session_1 = build_store(
+        tmp_path,
+        live_bars={"BTC": ohlc_path("BTC", steps), **companion_flat_bars(len(steps))},
+        snapshots=[make_snapshot()],
+        history={"BTC": flat_history("BTC", 64, 100.0)},
+        derivatives_sleeve=ForcedSignalDerivativesSleeve(asset="BTC", direction=1, p_meta=0.80, edge_bps=60.0),
+        ledger_name="account_ledger.json",
+    )
     assert store_session_1.ledger_summary["base_capital_usd"] == 5000.0
     assert store_session_1.ledger_summary["current_equity_usd"] == 5000.0
     assert store_session_1.ledger_summary["total_realized_pnl"] == 0.0
@@ -811,59 +831,75 @@ def test_account_ledger_restart_durability(tmp_path: Path) -> None:
     assert store_session_1.ledger_summary["total_trades"] == 0
     assert test_ledger.exists()
 
-    # Verify on-disk initial state conforms to AccountLedgerData contract
     raw_disk_1 = json.loads(test_ledger.read_text(encoding="utf-8"))
     ledger_data_1 = AccountLedgerData(**raw_disk_1)
     assert ledger_data_1.base_capital_usd == 5000.0
     assert ledger_data_1.current_cash_usd == 5000.0
     assert ledger_data_1.total_trades == 0
 
-    # 2. Advance simulated trading engine by 4 bars to accumulate trades and PnL
-    for _ in range(4):
+    # 2. Replay the scripted path: three positions close, one re-entry stays open.
+    for _ in range(len(steps)):
         store_session_1.step_simulation_tick()
 
     accumulated_pnl = store_session_1.ledger_summary["total_realized_pnl"]
     wins = store_session_1.ledger_summary["win_count"]
     losses = store_session_1.ledger_summary["loss_count"]
     trades_count = store_session_1.ledger_summary["total_trades"]
-    assert trades_count == 4
-    assert wins + losses == 4
+    assert trades_count == 3
+    assert wins + losses == 3
+    assert store_session_1.ledger_summary["open_positions"] == 1
     assert store_session_1.latest_forensic is not None
-    last_trade_id = store_session_1.latest_forensic["trade_id"]
+    last_decision_id = store_session_1.latest_forensic["trade_id"]
+    open_before = list(store_session_1.position_manager.open_positions.values())
+    assert len(open_before) == 1
     last_equity = store_session_1.ledger_summary["current_equity_usd"]
     assert last_equity == pytest.approx(5000.0 + accumulated_pnl, rel=1e-5)
 
-    # Verify disk matches in-memory session 1 before shutdown
     raw_disk_before_shutdown = json.loads(test_ledger.read_text(encoding="utf-8"))
     assert raw_disk_before_shutdown["base_capital_usd"] == 5000.0
     assert raw_disk_before_shutdown["total_realized_pnl"] == round(accumulated_pnl, 2)
     assert raw_disk_before_shutdown["win_count"] == wins
     assert raw_disk_before_shutdown["loss_count"] == losses
-    assert len(raw_disk_before_shutdown["trade_history"]) == 4
+    assert len(raw_disk_before_shutdown["trade_history"]) == 3
+    assert len(raw_disk_before_shutdown["open_positions"]) == 1
+    assert len(raw_disk_before_shutdown["forensics_history"]) == len(steps)
 
     # 3. Simulate server shutdown: tear down session 1
     del store_session_1
 
-    # 4. Simulate server restart: initialize fresh store instance pointing to same ledger file
-    store_session_2 = ControlCenterStateStore(ledger_path=test_ledger)
+    # 4. Restart against the same ledger with a continuing quiet feed.
+    quiet = flat_bars("BTC", len(steps), 2, 100.2)
+    store_session_2 = build_store(
+        tmp_path,
+        live_bars={"BTC": quiet, **companion_flat_bars(2, start_index=len(steps))},
+        snapshots=[make_snapshot()],
+        history={"BTC": flat_history("BTC", 64, 100.0)},
+        derivatives_sleeve=ForcedSignalDerivativesSleeve(asset="BTC", direction=1, p_meta=0.80, edge_bps=60.0),
+        ledger_name="account_ledger.json",
+    )
     assert store_session_2.ledger_summary["base_capital_usd"] == 5000.0
     assert store_session_2.ledger_summary["total_realized_pnl"] == pytest.approx(accumulated_pnl, rel=1e-5)
     assert store_session_2.ledger_summary["win_count"] == wins
     assert store_session_2.ledger_summary["loss_count"] == losses
-    assert store_session_2.ledger_summary["total_trades"] == 4
+    assert store_session_2.ledger_summary["total_trades"] == 3
     assert store_session_2.latest_forensic is not None
-    assert store_session_2.latest_forensic["trade_id"] == last_trade_id
+    assert store_session_2.latest_forensic["trade_id"] == last_decision_id
     assert store_session_2.ledger_summary["current_equity_usd"] == pytest.approx(last_equity, rel=1e-5)
+    restored = list(store_session_2.position_manager.open_positions.values())
+    assert len(restored) == 1
+    assert restored[0].position_id == open_before[0].position_id
+    assert restored[0].entry_price == open_before[0].entry_price
 
-    # 5. Execute 5th trade on restarted server and verify persistence continues seamlessly
+    # 5. A quiet bar after the restart holds the position: counters do not move without a close.
     store_session_2.step_simulation_tick()
-    assert store_session_2.ledger_summary["total_trades"] == 5
-    assert store_session_2.ledger_summary["win_count"] + store_session_2.ledger_summary["loss_count"] == 5
+    assert store_session_2.ledger_summary["total_trades"] == 3
+    assert store_session_2.ledger_summary["open_positions"] == 1
+    assert len(store_session_2.forensics_history) == len(steps) + 1
 
     raw_disk_after_reboot = json.loads(test_ledger.read_text(encoding="utf-8"))
     ledger_data_reboot = AccountLedgerData(**raw_disk_after_reboot)
     assert ledger_data_reboot.base_capital_usd == 5000.0
-    assert ledger_data_reboot.total_trades == 5
+    assert ledger_data_reboot.total_trades == 3
     assert ledger_data_reboot.current_equity_usd == pytest.approx(
         5000.0 + store_session_2.ledger_summary["total_realized_pnl"], rel=1e-5
     )
@@ -878,8 +914,14 @@ def test_account_ledger_restart_durability(tmp_path: Path) -> None:
 
 def test_trade_forensics_feature_attribution_endpoint(tmp_path: Path) -> None:
     """Verify /api/forensics endpoint returns structured 10-factor feature attribution and 'Why Did It Trade?' rationale."""
-    test_ledger = tmp_path / "forensics_ledger.json"
-    store = ControlCenterStateStore(ledger_path=test_ledger)
+    # Phase 0: decision records come from real processed bars on a scripted, network-free feed.
+    store = build_store(
+        tmp_path,
+        live_bars={"BTC": flat_bars("BTC", 0, 2, 100.0), **companion_flat_bars(2)},
+        snapshots=[make_snapshot(funding_1h={"BTC": 0.000125})],
+        history={"BTC": flat_history("BTC", 64, 100.0)},
+        ledger_name="forensics_ledger.json",
+    )
     app = create_app(store)
     client = TestClient(app)
 
@@ -942,7 +984,10 @@ def test_trade_forensics_feature_attribution_endpoint(tmp_path: Path) -> None:
         "kelly_conviction",
         "m_regime_multiplier",
     }
-    assert set(feat_attr.keys()) == expected_10_factors
+    # Phase 0 adds the EWMA sigma and the real HRP risk budgets to the attribution.
+    assert expected_10_factors <= set(feat_attr.keys())
+    assert "sigma_bar_ewma96" in feat_attr
+    assert {"hrp_w_BTC", "hrp_w_ETH", "hrp_w_SOL"} <= set(feat_attr.keys())
     for factor_name, factor_val in feat_attr.items():
         assert isinstance(factor_val, (int, float)), f"Factor {factor_name} is not numeric: {type(factor_val)}"
         assert not math.isnan(factor_val), f"Factor {factor_name} is NaN"

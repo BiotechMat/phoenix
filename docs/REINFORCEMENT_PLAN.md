@@ -83,6 +83,31 @@ Goal: `ControlCenterStateStore.step_simulation_tick` in `ui/api_server.py` evalu
 
 **Phase 0 gate**: an end-to-end replay with zero signals produces an unchanged ledger; a replay with scripted signals produces the expected trades; `tests/test_e2e_phoenix.py` extended with the above tests passes; the dashboard sleeve panel shows live values.
 
+### Phase 0 implementation status (2026-10-31)
+
+Implemented on branch `claude/intelligent-sagan-q8qknt`. Acceptance tests live in `tests/test_phase0_integrity.py` (25 tests, offline, no random data); the gate tests are `test_phase0_gate_zero_signal_replay_leaves_ledger_unchanged` and `test_phase0_gate_scripted_signals_produce_expected_trades_and_live_sleeve_panel`.
+
+| Task | Status | Where |
+|------|--------|-------|
+| P0.1 | Done. Both sleeves are evaluated for BTC, ETH and SOL on every bar; `AssetAllocationInput` is built from each `SleeveSignalOutput`; `sleeve_telemetry` returns the latest real evaluations (per-asset carry evaluations, derivatives signals, HRP weights, availability, per-sleeve attribution). The hard-coded ETH long and SOL short are gone. | `ui/api_server.py` (`_evaluate_sleeves`, `_build_targets`, `sleeve_telemetry`) |
+| P0.2 | Done. No probability floor, no direction default; `predict_single` receives the real positioning direction including 0. With no trained model the meta sleeve emits p = 0.5, direction 0, gate closed. | `ui/api_server.py` |
+| P0.3 | Done. `RollingHourlyReturnMatrix` holds 1h log returns for the three assets (seeded from Hyperliquid 1h candles, appended live); `HRPWeightScheduler` recomputes HRP-CVaR at most hourly and falls back to equal weights with a logged warning below 96 rows. | `risk/portfolio_allocator.py` |
+| P0.4 | Done (interim, candles only). Bars are Hyperliquid `candleSnapshot` 15m candles (real OHLCV and trade count); funding from `fundingHistory` for the seed and the live snapshot for new bars; taker buy/sell split is unavailable and reported as such (even split); `liquidation_volume_usd = 0.0` with `DataAvailability.liquidations = False`; `sigma_bar` is the EWMA of 15m log returns with span 96. No `numpy.random` call exists in the tick path. | `core/data_ingestion.py` (`HyperliquidCandleBarFeed`, `ScriptedBarFeed`), `core/models/triple_barrier.py` (`EWMAVolatilityEstimator`) |
+| P0.5 | Done. `PositionManager` opens on a non-zero target when flat; exits on barrier touch against the bar high/low (same-bar double touch resolves to the stop), vertical expiry, regime veto, or a flipped target; hedged carry exits when the sleeve clears or flips; PnL and fees realised on close; per-sleeve attribution; win/loss counters move on close only. Open positions are persisted in the ledger and restored on restart. | `core/execution/position_manager.py`, `core/contracts.py` (`Position`, `ClosedTradeRecord`, `SleeveAttribution`) |
+| P0.6 | Done. Funding accrues per bar on open perp legs only, signed (long pays positive funding; a carry perp-short is debited when funding is negative); fees are charged on notional actually traded per leg (maker on entries and passive exits, taker on stop-outs and vetoes). The fixed 8% turnover and the derived "fee savings" are removed (reported as 0). | `core/execution/position_manager.py`, `ui/api_server.py` |
+| P0.7 | Done. Single-class labels skip the fit and keep the previous worker; training uses the Parquet store of real-feed bars with the last `vertical_barrier_bars` purged and requires at least 500 labelled bars; retraining runs on a daily schedule in bar time. | `ui/api_server.py` (`_fit_worker_on_bars`, `_maybe_retrain`) |
+| P0.8 | Not started (depends on P1.4). The macro sentinel still receives fixed depeg and DVOL inputs; the breadth model now receives real per-asset 1h funding. | |
+
+Consequences worth knowing:
+
+- One tick now processes one closed 15-minute candle. A tick between candle closes returns `waiting_for_bar` and changes nothing; the dashboard poller runs every 10 seconds.
+- Hyperliquid has no public open-interest history, so seeded bars carry the current OI and are not written to the training store. The meta-labeller therefore has no model until roughly 500 live bars with real OI have been recorded (about five days), and the dashboard says so. P1.2 (Bybit OI history backfill) removes this wait.
+- Reported equity is base capital plus realised PnL; unrealised PnL of open positions is reported separately (`unrealized_pnl_usd`, `marked_equity_usd`).
+- The cross-venue funding spread has no second-venue feed yet and is reported as `null`.
+- Paper PnL will look worse than before. The previous numbers measured a forced trade every bar with a probability floor, not a strategy.
+
+Existing tests changed: `test_account_ledger_restart_durability` and `test_trade_forensics_feature_attribution_endpoint` (`tests/test_architecture_verification.py`) now replay scripted bars on an isolated ledger, assert that trades are closed positions and that open positions survive a restart, and accept the two new feature-attribution keys; `test_r5_f21_persistent_account_ledger_initialization_5000_usd` (`tests/test_e2e_phoenix.py`) uses an isolated store so the reset no longer rewrites `data/account_ledger.json`.
+
 ---
 
 ## Phase 1: Data and research infrastructure (weeks 2 to 4)

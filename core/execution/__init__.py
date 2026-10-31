@@ -7,6 +7,13 @@ from core.execution.defensive_maker import (
     DefensiveMakerExecutionAlgorithm,
     RestingMakerOrderState,
 )
+from core.execution.position_manager import (
+    TAKER_EXIT_REASONS,
+    BarMarks,
+    PositionManager,
+    SleeveTarget,
+    position_key,
+)
 from core.execution.vpin_hawkes import (
     RecursiveHawkesMonitor,
     RollingBVCVPINMonitor,
@@ -17,13 +24,18 @@ from core.execution.vpin_hawkes import (
 )
 
 __all__ = [
+    "TAKER_EXIT_REASONS",
+    "BarMarks",
     "DefensiveMakerConfig",
     "DefensiveMakerExecutionAlgorithm",
+    "PositionManager",
     "RecursiveHawkesMonitor",
     "RestingMakerOrderState",
     "RollingBVCVPINMonitor",
+    "SleeveTarget",
     "hawkes_analytical_neg_loglik_numba",
     "hawkes_recursive_batch_numba",
     "hawkes_recursive_step_numba",
+    "position_key",
     "refit_parameters_mle_lbfgsb",
 ]

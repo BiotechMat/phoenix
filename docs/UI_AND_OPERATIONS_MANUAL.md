@@ -117,3 +117,10 @@ Never rush directly into live capital. Follow this 5-step graduation protocol:
    - Test `/pause` and `/flat` from Telegram (or the web dashboard) during `Dry-Run` mode to verify instant response.
 5. **Stage 5 — Start at 10% Capital Allocation:**
    - When switching to live exchange API keys, fund the sub-account with only 10% of your intended capital for the first 14 days while monitoring live 30-day rolling PSR (`champion_live_30d_psr >= 0.80`).
+
+## What changed in Phase 0 of the reinforcement plan
+
+- **One bar is one real 15-minute Hyperliquid candle.** "▶ Start Dry-Run" polls every 10 seconds and processes a bar only when a new candle has closed. "⚡ Poll Next 15m Bar" checks once; if nothing has closed yet the engine says so and nothing changes.
+- **Trades are positions, not bars.** A position opens when a sleeve has a real signal, and closes at its profit barrier, its stop barrier, after 16 bars, on a risk-committee veto, or when the signal flips. Wins and losses are counted only when a position closes. "Equity" is starting capital plus realised profit; open positions show separately as unrealised PnL.
+- **Nothing is invented.** Inputs without a live feed (taker buy/sell split, liquidations, open-interest history, a second funding venue) are shown as unavailable. The AI win-probability model trains only once about five days of real bars have been recorded; until then the meta sleeve stays flat and the panel says "no model".
+- **The sleeve panel is live.** Funding carry APR, breakeven hours, actionability, Deribit skew, dealer GEX and HLP crowding come from the sleeves' latest real evaluations on every bar.

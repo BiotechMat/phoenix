@@ -1307,7 +1307,7 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
         ▶ Start Dry-Run
       </button>
       <button id="btn-step_bar" class="btn btn-step" title="Immediately simulate 1 new 15-minute market bar and update chart &amp; profit" onclick="stepSingleBar()">
-        ⚡ Step +1 Bar Now
+        ⚡ Poll Next 15m Bar
       </button>
       <button id="btn-pause_entries" class="btn btn-pause" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['pause_entries'])}" onclick="sendControl('pause_entries')">
         ⏸ Pause Entries
@@ -1582,7 +1582,7 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
             <span id="tick-badge" style="font-size: 0.78rem; color: var(--green);">● Ready</span>
           </h3>
           <ul id="activity-log-list" class="activity-list">
-            <li class="activity-item">Click <strong>"▶ Start Dry-Run"</strong> above to start live paper-trading bars, or click <strong>"⚡ Step +1 Bar Now"</strong> to advance 1 bar at a time.</li>
+            <li class="activity-item">Click <strong>"▶ Start Dry-Run"</strong> above to paper-trade each closed Hyperliquid 15-minute candle as it arrives, or click <strong>"⚡ Poll Next 15m Bar"</strong> to check for the next closed candle now. A tick with no new candle changes nothing; wins and losses are counted only when a position closes.</li>
             <li class="activity-item">[Initial State] BTC @ ${latest_bar.close:,.2f} | AI Confidence: {latest_meta.p_meta:.0%} | All 4 Safety Shields Green.</li>
           </ul>
         </div>
@@ -1926,7 +1926,7 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
           const carryAprEl = document.getElementById('sleeve-carry-apr');
           if (carryAprEl) carryAprEl.textContent = (fc.annualized_apr_pct >= 0 ? '+' : '') + Number(fc.annualized_apr_pct).toFixed(1) + '% APR';
           const crossSpreadEl = document.getElementById('sleeve-cross-spread');
-          if (crossSpreadEl) crossSpreadEl.textContent = `+${{Number(fc.cross_venue_spread_bps).toFixed(1)}} bps (${{fc.venue_pair || 'HL vs Bybit'}})`;
+          if (crossSpreadEl) crossSpreadEl.textContent = (fc.cross_venue_spread_bps === null || fc.cross_venue_spread_bps === undefined) ? 'n/a (no second venue feed)' : `${{Number(fc.cross_venue_spread_bps) >= 0 ? '+' : ''}}${{Number(fc.cross_venue_spread_bps).toFixed(1)}} bps (${{fc.venue_pair || 'HL vs Bybit'}})`;
           const breakevenEl = document.getElementById('sleeve-breakeven');
           if (breakevenEl) breakevenEl.textContent = `${{Number(fc.breakeven_hours).toFixed(1)}} hours`;
         }}
@@ -1935,9 +1935,9 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
           const skewEl = document.getElementById('sleeve-skew');
           if (skewEl) skewEl.textContent = `${{(da.deribit_25d_skew * 100).toFixed(1)}}% (${{da.deribit_25d_skew >= 0 ? 'Bullish Demand' : 'Bearish Demand'}})`;
           const termEl = document.getElementById('sleeve-term');
-          if (termEl) termEl.textContent = `${{da.term_structure_label || 'Contango'}} (Slope: +${{Number(da.term_structure_slope).toFixed(3)}})`;
+          if (termEl) termEl.textContent = `${{da.term_structure_label || 'n/a'}} (Slope: ${{Number(da.term_structure_slope) >= 0 ? '+' : ''}}${{Number(da.term_structure_slope).toFixed(3)}})`;
           const gexEl = document.getElementById('sleeve-gex');
-          if (gexEl) gexEl.textContent = `+$${{(Number(da.net_dealer_gex_usd) / 1e6).toFixed(1)}}M (${{da.gex_regime || 'Pinning'}})`;
+          if (gexEl) gexEl.textContent = `${{Number(da.net_dealer_gex_usd) >= 0 ? '+' : '-'}}$${{Math.abs(Number(da.net_dealer_gex_usd) / 1e6).toFixed(1)}}M (${{da.gex_regime || 'n/a'}})`;
           const vaultEl = document.getElementById('sleeve-vault');
           if (vaultEl) vaultEl.textContent = `${{da.hlp_crowding || 'Balanced'}} (${{da.counterparty_vulnerability || 'Low'}} Vuln)`;
         }}

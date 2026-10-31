@@ -134,6 +134,7 @@ from ui.api_server import (
     create_app,
 )
 from ui.dashboard_app import PLAIN_ENGLISH_TOOLTIPS
+from tests.phase0_helpers import build_store, flat_bars, flat_history, make_snapshot
 
 
 # ==============================================================================
@@ -713,7 +714,14 @@ class TestTier1FeatureCoverage:
     def test_r5_f21_persistent_account_ledger_initialization_5000_usd(self, tmp_path: Path) -> None:
         """R5.1: Verify persistent ledger loads and initializes with exactly $5,000.00 base capital."""
         ledger_file = tmp_path / "account_ledger.json"
-        store = ControlCenterStateStore()
+        # Phase 0: isolated ledger and scripted feed so the reset never touches the project ledger.
+        store = build_store(
+            tmp_path,
+            live_bars={"BTC": flat_bars("BTC", 0, 1, 100.0)},
+            snapshots=[make_snapshot()],
+            history={"BTC": flat_history("BTC", 64, 100.0)},
+            ledger_name="store_ledger.json",
+        )
         reset_res = store.reset_account(starting_capital_usd=5000.0)
         assert reset_res.starting_capital_usd == 5000.0
         assert reset_res.current_equity_usd == 5000.0

@@ -738,3 +738,132 @@ class EnvironmentConfig(BaseModel):
         if total_active_gb > 50.0:
             raise ValueError(f"Active memory budget {total_active_gb} GB exceeds 50.0 GB ceiling (64GB M1 Max)")
         return self
+
+
+# ==============================================================================
+# Phase 0 position lifecycle and data-availability records (REINFORCEMENT_PLAN P0.4 / P0.5)
+# ==============================================================================
+
+
+class PositionExitReason(str, Enum):
+    """Why an open paper position was closed."""
+
+    PROFIT_BARRIER = "PROFIT_BARRIER"
+    STOP_BARRIER = "STOP_BARRIER"
+    VERTICAL_EXPIRY = "VERTICAL_EXPIRY"
+    REGIME_VETO = "REGIME_VETO"
+    TARGET_FLIPPED = "TARGET_FLIPPED"
+    TARGET_CLEARED = "TARGET_CLEARED"
+
+
+class Position(BaseModel):
+    """Open paper position for one (sleeve, asset) pair with its triple-barrier exit plan.
+
+    ``side`` is the sign of the perpetual leg. A ``hedged`` position is the delta-neutral
+    spot-long / perp-short carry structure: the spot leg is ``size`` base units bought at
+    ``spot_entry_price`` and the perp leg is ``size`` base units sold at ``entry_price``.
+    ``upper_barrier`` is always the higher price level and ``lower_barrier`` the lower one;
+    for a long the upper level is the profit target, for a short it is the stop.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    position_id: str
+    asset: str
+    sleeve_id: str
+    side: Literal[-1, 1]
+    hedged: bool = False
+    entry_price: float = Field(gt=0.0)
+    spot_entry_price: float | None = None
+    entry_bar_index: int = Field(ge=0)
+    entry_ts_ns: int = Field(ge=0)
+    size: float = Field(gt=0.0)
+    notional_usd: float = Field(gt=0.0)
+    target_weight: float
+    upper_barrier: float | None = None
+    lower_barrier: float | None = None
+    vertical_bar_index: int | None = None
+    entry_fee_usd: float = Field(ge=0.0)
+    funding_accrued_usd: float = 0.0
+    bars_held: int = Field(default=0, ge=0)
+    sigma_bar_at_entry: float = Field(default=0.0, ge=0.0)
+    entry_reason: str = ""
+
+    @property
+    def profit_barrier(self) -> float | None:
+        """Price level at which the position takes profit (None for hedged carry)."""
+        return self.upper_barrier if self.side > 0 else self.lower_barrier
+
+    @property
+    def stop_barrier(self) -> float | None:
+        """Price level at which the position stops out (None for hedged carry)."""
+        return self.lower_barrier if self.side > 0 else self.upper_barrier
+
+
+class ClosedTradeRecord(BaseModel):
+    """Realised outcome of a closed position. Win/loss counters are derived from these only."""
+
+    model_config = ConfigDict(frozen=True)
+
+    trade_id: str
+    position_id: str
+    asset: str
+    sleeve_id: str
+    side: Literal[-1, 1]
+    hedged: bool
+    entry_price: float = Field(gt=0.0)
+    exit_price: float = Field(gt=0.0)
+    spot_entry_price: float | None = None
+    spot_exit_price: float | None = None
+    entry_bar_index: int = Field(ge=0)
+    exit_bar_index: int = Field(ge=0)
+    entry_ts_ns: int = Field(ge=0)
+    exit_ts_ns: int = Field(ge=0)
+    size: float = Field(gt=0.0)
+    notional_usd: float = Field(gt=0.0)
+    exit_reason: PositionExitReason
+    gross_pnl_usd: float
+    funding_pnl_usd: float
+    fee_usd: float = Field(ge=0.0)
+    net_pnl_usd: float
+    net_return_bps: float
+    bars_held: int = Field(ge=0)
+    is_win: bool
+    entry_reason: str = ""
+
+
+class SleeveAttribution(BaseModel):
+    """Per-sleeve realised and open PnL attribution."""
+
+    model_config = ConfigDict(frozen=True)
+
+    sleeve_id: str
+    closed_trades: int = Field(default=0, ge=0)
+    wins: int = Field(default=0, ge=0)
+    losses: int = Field(default=0, ge=0)
+    gross_pnl_usd: float = 0.0
+    funding_pnl_usd: float = 0.0
+    fees_usd: float = Field(default=0.0, ge=0.0)
+    net_pnl_usd: float = 0.0
+    open_positions: int = Field(default=0, ge=0)
+    unrealized_pnl_usd: float = 0.0
+
+
+class DataAvailability(BaseModel):
+    """Which live inputs are backed by a real feed.
+
+    Anything reported ``False`` is zero-filled (or ``None``) and flagged; it is never
+    synthesised from a random generator in a live code path.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    candles: bool = False
+    taker_flow: bool = False
+    liquidations: bool = False
+    open_interest_history: bool = False
+    funding_history: bool = False
+    options_surface: bool = False
+    hlp_vault: bool = False
+    hourly_return_rows: int = Field(default=0, ge=0)
+    feed_source: str = "UNAVAILABLE"

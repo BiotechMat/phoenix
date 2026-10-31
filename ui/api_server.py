@@ -1,32 +1,41 @@
 """FastAPI Control Center Server (``http://localhost:8080``) for Gemini Argon 4.
 
 Exposes:
-- ``GET /``: Simplified, interactive HTML Control Center with live Dry-Run simulation,
+- ``GET /``: Simplified, interactive HTML Control Center with live Dry-Run paper trading,
   customizable starting capital, profit reset, plain-English activity feed, and docs.
-- ``GET /api/state``: Live telemetry, net-of-fee PnL, Maker/Taker ratio, ASRI summary,
-  CPCV promotion gates, signed ``HRP-CVaR`` target weights, and live activity log.
-- ``POST /api/tick``: Advances the paper-trading engine by one bar using real ML inference
-  (FFD -> Positioning -> SVD -> Mahalanobis Gate -> Calibrated LightGBM -> VPIN/Hawkes -> HRP-CVaR)
-  and honest mark-to-market PnL (with real winning AND losing bars net of fees).
+- ``GET /api/state``: Live telemetry, net-of-fee PnL, open positions, sleeve telemetry and
+  attribution, data availability, CPCV promotion gates, signed HRP-CVaR target weights, and
+  the activity log.
+- ``POST /api/tick``: Polls the bar feed. When a new closed 15-minute Hyperliquid candle exists
+  the engine advances one bar: real features (FFD -> Positioning -> SVD -> Mahalanobis Gate ->
+  Calibrated LightGBM), the funding-carry and derivatives-alpha sleeves, hourly HRP-CVaR risk
+  budgets, the position lifecycle (entries, triple-barrier exits, vertical expiry, regime veto,
+  flipped targets), signed funding accrual on open perp legs, and fees on notional actually traded.
+  Win/loss counters change only when a position closes. If no new candle has closed yet the tick
+  is a no-op that reports ``waiting_for_bar``.
 - ``POST /api/reset``: Resets paper trading profit to $0.00 and sets a custom starting capital.
 - ``GET /api/tooltips``: Complete ``PLAIN_ENGLISH_TOOLTIPS`` dictionary.
-- ``GET /api/docs/{doc_name}``: Renders any of the four ``docs/*.md`` layman's manuals.
+- ``GET /api/docs/{doc_name}``: Renders any of the four ``docs/*.md`` manuals.
 - ``POST /api/control/{action}``: Handles one-click operational controls
   (``start_dry_run``, ``pause_entries``, ``switch_carry_only``, ``emergency_flatten``).
+
+No random or synthetic data is used in any live path. Inputs without a real feed (taker flow,
+liquidations, open-interest history, a second funding venue) are zero-filled or ``None`` and
+reported in ``data_availability``.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
-from typing import Any, Literal
-import urllib.request
+from typing import Any, Final, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -36,29 +45,48 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.contracts import (
     AssetAllocationInput,
+    AssetMarketSnapshot,
+    ClosedTradeRecord,
+    DataAvailability,
+    DeribitOptionsSurface,
     DollarBar,
     ExecutionAction,
     ExecutionOrderCommand,
     ExecutionRegimeMode,
     FeeSchedule,
+    FFDWeightsConfig,
     HawkesStateSnapshot,
+    HyperliquidWhaleVaultMetrics,
     MetaPredictionOutput,
     MultiAssetMarketSnapshot,
+    Position,
+    PositionExitReason,
     PositioningSignalSnapshot,
+    PortfolioAllocationOutput,
     TripleBarrierConfig,
     TripleBarrierLabel,
     compute_fractional_kelly,
-    compute_regime_multiplier_from_asri,
     compute_signed_target_weights,
 )
-from core.data_ingestion import get_live_multi_asset_snapshot, normalize_coin_symbol
-from core.execution import RecursiveHawkesMonitor, RollingBVCVPINMonitor
+from core.data_ingestion import BarFeed, HyperliquidCandleBarFeed, normalize_coin_symbol
+from core.execution import (
+    BarMarks,
+    PositionManager,
+    RecursiveHawkesMonitor,
+    RollingBVCVPINMonitor,
+    SleeveTarget,
+    position_key,
+)
 from core.features import calibrate_optimal_d, compute_positioning_snapshots
 from core.models import (
+    EWMAVolatilityEstimator,
     FeeAdjustedTripleBarrierLabeler,
     LightGBMMetaLabelWorker,
+    compute_effective_barriers,
+    compute_ewma_volatility,
     extract_continuous_and_binary_from_snapshots,
 )
+from risk.portfolio_allocator import HRPWeightScheduler, RollingHourlyReturnMatrix
 from sentiment.committee_models import (
     AdversarialRedTeamCritic,
     BreadthAnalystOutput,
@@ -71,8 +99,13 @@ from sentiment.committee_models import (
     RiskCommitteeConsensusEngine,
     RiskCommitteeOutput,
 )
-from sleeves.sleeve_3_funding_carry import FundingCarrySleeve
-from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaSleeve
+from sleeves.sleeve_1_derivatives_alpha import DerivativesAlphaSignal, DerivativesAlphaSleeve
+from sleeves.sleeve_3_funding_carry import (
+    CarryDirection,
+    CarryOpportunityEvaluation,
+    FundingCarrySleeve,
+    SleeveSignalOutput,
+)
 from ui.dashboard_app import (
     DOC_FILENAMES,
     PLAIN_ENGLISH_TOOLTIPS,
@@ -93,9 +126,31 @@ LEDGER_FILE: Path = DATA_DIR / "account_ledger.json"
 
 logger = logging.getLogger("phoenix.engine")
 
+ASSETS: Final[tuple[str, str, str]] = ("BTC", "ETH", "SOL")
+SLEEVE_META_LABELLER: Final[str] = "meta_labeller"
+SLEEVE_DERIVATIVES: Final[str] = "derivatives_alpha"
+SLEEVE_FUNDING_CARRY: Final[str] = "funding_carry"
+
+HISTORY_SEED_BARS: Final[int] = 1200
+HRP_SEED_HOURS: Final[int] = 480
+FEATURE_WINDOW_BARS: Final[int] = 4096
+UI_WINDOW_BARS: Final[int] = 16
+MIN_TRAIN_LABELLED_BARS: Final[int] = 500
+RETRAIN_INTERVAL_NS: Final[int] = 24 * 3_600 * 1_000_000_000
+DERIVATIVES_INPUT_TTL_NS: Final[int] = 5 * 60 * 1_000_000_000
+WAITING_LOG_INTERVAL_SEC: Final[float] = 60.0
+MAX_GROSS_LEVERAGE: Final[float] = 2.5
+CARRY_TARGET_NOTIONAL_WEIGHT: Final[float] = 0.25
+REAL_BAR_SOURCES: Final[frozenset[str]] = frozenset({"HYPERLIQUID-L1", "BYBIT-V5-FALLBACK", "SCRIPTED-REAL"})
+STEP_15M_NS: Final[int] = 900_000_000_000
+
 
 class TradeForensicRecord(BaseModel):
-    """Structured trade forensics record documenting 'Why Did It Trade?' and feature attribution."""
+    """Per-bar decision record ("Why Did It Trade?") with feature attribution.
+
+    One record is written per processed bar. ``realized_pnl_usd`` is the net PnL of positions
+    closed on that bar (0.0 when nothing closed); it is not a mark-to-market of open positions.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -122,10 +177,15 @@ class TradeForensicRecord(BaseModel):
     kelly_fraction: float
     why_did_it_trade: str
     feature_attribution: dict[str, float]
+    sleeve_id: str = ""
+    entries: list[str] = Field(default_factory=list)
+    exits: list[str] = Field(default_factory=list)
+    open_positions: int = 0
+    unrealized_pnl_usd: float = 0.0
 
 
 class AccountLedgerData(BaseModel):
-    """Persistent account state tracking for $5,000.00 base capital paper trading."""
+    """Persistent account state for the paper-trading ledger."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -139,12 +199,15 @@ class AccountLedgerData(BaseModel):
     accumulated_gross_pnl_usd: float = 0.00
     total_fees_paid_usd: float = 0.00
     total_fee_savings_usd: float = 0.00
+    total_funding_pnl_usd: float = 0.00
     total_trades: int = 0
     win_count: int = 0
     loss_count: int = 0
     win_rate_pct: float = 0.0
     profit_factor: float = 0.0
     trade_history: list[dict[str, Any]] = Field(default_factory=list)
+    forensics_history: list[dict[str, Any]] = Field(default_factory=list)
+    open_positions: list[dict[str, Any]] = Field(default_factory=list)
     last_updated_iso: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -204,282 +267,267 @@ class ControlActionResult(BaseModel):
     activity_log: list[str] = []
     forensic_record: dict[str, Any] | None = None
     ledger_summary: dict[str, Any] | None = None
+    bar_processed: bool = False
+    closed_trades: list[dict[str, Any]] = Field(default_factory=list)
+    opened_positions: list[dict[str, Any]] = Field(default_factory=list)
 
 
-def _try_fetch_live_btc_price(fallback_price: float, rng: np.random.Generator) -> tuple[float, str]:
-    """Try fetching real live BTC-USD price from Coinbase public ticker; fallback to stochastic walk."""
+def _persist_bars_to_parquet(bars: Sequence[DollarBar], path: Path, bar_source: str) -> int:
+    """Append collected DollarBars to the Parquet training store, tagging the real feed they came from."""
+    if not bars:
+        try:
+            return int(pl.read_parquet(path).height) if path.exists() else 0
+        except Exception:
+            return 0
     try:
-        req = urllib.request.Request(
-            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-            headers={"User-Agent": "ProjectPhoenix/4.0"},
-        )
-        with urllib.request.urlopen(req, timeout=0.6) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-            spot = float(payload["data"]["amount"])
-            # Blend live Coinbase spot price with realistic 15m bar microstructure dispersion (~18 bps)
-            jitter = float(rng.normal(0.0, spot * 0.0018))
-            return round(max(1000.0, spot + jitter), 2), "LIVE-EXCHANGE"
-    except Exception:
-        # Honest zero-drift stochastic market walk (can go UP or DOWN!)
-        ret = float(rng.normal(0.0001, 0.0022))
-        return round(max(1000.0, fallback_price * (1.0 + ret)), 2), "SIMULATED-FEED"
-
-
-def _try_fetch_live_bybit_perp_snapshot(
-    fallback_bar: DollarBar, rng: np.random.Generator
-) -> tuple[float, float, float, float, float, str]:
-    """Fetch live BTCUSDT Perpetual (close, mark, spot_index, open_interest, funding_8h, source) from Bybit V5."""
-    try:
-        req = urllib.request.Request(
-            "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT",
-            headers={"User-Agent": "ProjectPhoenix/4.0"},
-        )
-        with urllib.request.urlopen(req, timeout=0.8) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-            item = payload["result"]["list"][0]
-            last_px = float(item["lastPrice"])
-            mark_px = float(item.get("markPrice", last_px))
-            index_px = float(item.get("indexPrice", last_px))
-            oi_btc = float(item.get("openInterest", fallback_bar.open_interest))
-            funding_8h = float(item.get("fundingRate", fallback_bar.funding_rate_8h))
-            # Add realistic 15m bar dispersion (~16 bps) around live perpetual price if polled rapidly
-            jitter = float(rng.normal(0.0, last_px * 0.0016))
-            close_px = round(max(1000.0, last_px + jitter), 2)
-            return close_px, round(mark_px, 2), round(index_px, 2), round(oi_btc, 2), round(funding_8h, 6), "BYBIT-PERP-LIVE"
-    except Exception:
-        pass
-    close_px, src = _try_fetch_live_btc_price(fallback_bar.close, rng)
-    oi_btc = round(max(10_000.0, fallback_bar.open_interest * (1.0 + float(rng.normal(0.0002, 0.006)))), 2)
-    funding_8h = round(float(np.clip(fallback_bar.funding_rate_8h + rng.normal(0.0, 0.00005), -0.0008, 0.0009)), 6)
-    return close_px, round(close_px * (1.0 + funding_8h * 0.5), 2), close_px, oi_btc, funding_8h, src
-
-
-def _persist_bars_to_parquet(bars: list[DollarBar]) -> int:
-    """Append or overwrite collected DollarBars into data/btcusdt_perp_bars.parquet using Polars."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        rows = [b.model_dump() for b in bars]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [dict(b.model_dump(), bar_source=bar_source) for b in bars]
         new_df = pl.DataFrame(rows)
-        if PARQUET_BARS_FILE.exists():
-            existing_df = pl.read_parquet(PARQUET_BARS_FILE)
+        if path.exists():
+            existing_df = pl.read_parquet(path)
             combined = pl.concat([existing_df, new_df], how="diagonal_relaxed").unique(
                 subset=["ts_close_ns"], keep="last", maintain_order=True
             )
         else:
             combined = new_df
-        combined.write_parquet(PARQUET_BARS_FILE)
+        combined.write_parquet(path)
         return int(combined.height)
     except Exception as exc:
         logger.warning("Parquet persistence warning: %s", exc)
         return len(bars)
 
 
-def _fetch_initial_bybit_15m_history(rng: np.random.Generator) -> list[DollarBar]:
-    """Fetch 90 real historical 15m BTCUSDT perpetual bars + OI from Bybit V5 to seed Parquet training store."""
+def _load_training_bars_from_parquet(path: Path, max_rows: int = 20_000) -> list[DollarBar]:
+    """Load bars recorded by a real feed (``bar_source`` tagged) for model training, oldest first."""
+    if not path.exists():
+        return []
     try:
-        kline_req = urllib.request.Request(
-            "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=15&limit=90",
-            headers={"User-Agent": "ProjectPhoenix/4.0"},
-        )
-        oi_req = urllib.request.Request(
-            "https://api.bybit.com/v5/market/open-interest?category=linear&symbol=BTCUSDT&intervalTime=15min&limit=90",
-            headers={"User-Agent": "ProjectPhoenix/4.0"},
-        )
-        with urllib.request.urlopen(kline_req, timeout=1.5) as kr, urllib.request.urlopen(oi_req, timeout=1.5) as oir:
-            klines = list(reversed(json.loads(kr.read().decode("utf-8"))["result"]["list"]))
-            oi_list = list(reversed(json.loads(oir.read().decode("utf-8"))["result"]["list"]))
-        bars: list[DollarBar] = []
-        step_ns = 900_000_000_000
-        for idx, k in enumerate(klines):
-            ts_open_ms = int(k[0])
-            ts_open_ns = ts_open_ms * 1_000_000
-            ts_close_ns = ts_open_ns + step_ns
-            o_px, h_px, l_px, c_px = float(k[1]), float(k[2]), float(k[3]), float(k[4])
-            vol = max(1.0, float(k[5]))
-            dvol = max(c_px * vol, float(k[6]))
-            ret = (c_px - o_px) / max(o_px, 1.0)
-            buy_frac = float(np.clip(0.50 + ret * 35.0, 0.22, 0.78))
-            oi_val = float(oi_list[min(idx, len(oi_list) - 1)]["openInterest"]) if oi_list else 68_500.0
-            bars.append(
-                DollarBar(
-                    instrument_id="BTCUSDT-PERP",
-                    horizon_label="15m",
-                    ts_open_ns=ts_open_ns,
-                    ts_close_ns=ts_close_ns,
-                    open=round(o_px, 2),
-                    high=round(h_px, 2),
-                    low=round(l_px, 2),
-                    close=round(c_px, 2),
-                    volume=round(vol, 2),
-                    dollar_volume=round(dvol, 2),
-                    buy_dollar_volume=round(dvol * buy_frac, 2),
-                    sell_dollar_volume=round(dvol * (1.0 - buy_frac), 2),
-                    open_interest=round(oi_val, 2),
-                    funding_rate_8h=0.0001,
-                    mark_price=round(c_px, 2),
-                    spot_price=round(c_px * 0.9998, 2),
-                    liquidation_volume_usd=round(float(rng.exponential(140_000.0)), 2),
-                    tick_count=4200,
-                )
-            )
-        if len(bars) >= 60:
-            return bars
-    except Exception:
-        pass
-    return []
+        df = pl.read_parquet(path)
+    except Exception as exc:
+        logger.warning("Could not read Parquet training store %s: %s", path, exc)
+        return []
+    if "bar_source" not in df.columns or df.height == 0:
+        return []
+    df = df.filter(pl.col("bar_source").is_in(sorted(REAL_BAR_SOURCES))).sort("ts_close_ns").tail(max_rows)
+    field_names = set(DollarBar.model_fields.keys())
+    bars: list[DollarBar] = []
+    for row in df.iter_rows(named=True):
+        try:
+            bars.append(DollarBar(**{k: v for k, v in row.items() if k in field_names and v is not None}))
+        except Exception:
+            continue
+    return bars
 
 
-def _reanchor_state_to_live_price(
-    state: DashboardTelemetryState, live_spot: float
-) -> DashboardTelemetryState:
-    """Scale initial warm-up bars & barriers so Bar #12 matches the current live BTC spot price."""
-    old_last_close = state.dollar_bars[-1].close
-    if old_last_close <= 0 or abs(live_spot - old_last_close) < 1.0:
-        return state
-    scale = live_spot / old_last_close
-    scaled_bars = [
-        b.model_copy(
-            update={
-                "open": round(b.open * scale, 2),
-                "high": round(b.high * scale, 2),
-                "low": round(b.low * scale, 2),
-                "close": round(b.close * scale, 2),
-                "mark_price": round(b.mark_price * scale, 2),
-                "spot_price": round(b.spot_price * scale, 2),
-            }
-        )
-        for b in state.dollar_bars
-    ]
-    scaled_barriers = [
-        lbl.model_copy(
-            update={
-                "upper_barrier": round(lbl.upper_barrier * scale, 2),
-                "lower_barrier": round(lbl.lower_barrier * scale, 2),
-            }
-        )
-        for lbl in state.barrier_labels
-    ]
-    return state.model_copy(
-        update={
-            "dollar_bars": scaled_bars,
-            "barrier_labels": scaled_barriers,
-        }
+def _neutral_meta_prediction(instrument_id: str, ts_close_ns: int, reason: str) -> MetaPredictionOutput:
+    """Meta prediction emitted when no trained model exists: p = 0.5, direction 0, gate closed."""
+    _ = reason
+    return MetaPredictionOutput(
+        instrument_id=instrument_id,
+        ts_close_ns=ts_close_ns,
+        primary_direction=0,
+        p_meta=0.5,
+        mahalanobis_di=0.0,
+        di_threshold=3.50,
+        epistemic_gate_passed=False,
+        svd_factors=(),
+        liquidation_exhaustion_flag=0,
+        expected_net_edge_bps=0.0,
     )
 
 
 class ControlCenterStateStore:
-    """In-memory + Parquet state store running real ML inference and honest mark-to-market PnL."""
+    """In-memory + Parquet state store running the real strategy stack on real closed bars."""
 
     def __init__(
         self,
         initial_state: DashboardTelemetryState | None = None,
         ledger_path: Path | None = None,
+        feed: BarFeed | None = None,
+        carry_sleeve: FundingCarrySleeve | None = None,
+        derivatives_sleeve: DerivativesAlphaSleeve | None = None,
+        fee_schedule: FeeSchedule | None = None,
+        parquet_path: Path | None = None,
+        seed_bars: int = HISTORY_SEED_BARS,
+        hrp_seed_hours: int = HRP_SEED_HOURS,
+        fetch_derivatives_inputs: bool = True,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
+        self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
+        self._fee: FeeSchedule = fee_schedule or FeeSchedule.hyperliquid()
+        self._barrier_cfg: TripleBarrierConfig = TripleBarrierConfig(fee_schedule=self._fee)
+        self._fetch_derivatives_inputs: bool = fetch_derivatives_inputs
+
         self._starting_capital_usd: float = 5_000.0
         self._base_capital_usd: float = 5_000.0
         self._total_realized_pnl: float = 0.0
         self._total_fees_paid_usd: float = 0.0
         self._total_fee_savings_usd: float = 0.0
+        self._total_funding_pnl_usd: float = 0.0
         self._wins: int = 0
         self._losses: int = 0
+        self._maker_fills: int = 0
+        self._taker_fills: int = 0
         self._trade_history: list[dict[str, Any]] = []
         self._forensics_history: list[dict[str, Any]] = []
         self._latest_forensic: dict[str, Any] | None = None
+        self._restored_positions: list[Position] = []
 
         # 3-Model Apple Silicon (MLX) Risk Committee & Quantitative Sleeves
         self._risk_sentinel = MacroStablecoinSentinel()
         self._risk_breadth = CrossSectionalBreadthAnalyst()
         self._risk_critic = AdversarialRedTeamCritic()
         self._risk_consensus = RiskCommitteeConsensusEngine()
-        self._funding_carry_sleeve = FundingCarrySleeve()
-        self._derivatives_alpha_sleeve = DerivativesAlphaSleeve()
+        self._funding_carry_sleeve: FundingCarrySleeve = carry_sleeve or FundingCarrySleeve()
+        self._derivatives_alpha_sleeve: DerivativesAlphaSleeve = derivatives_sleeve or DerivativesAlphaSleeve()
+        self._derivatives_inputs_cache: dict[str, tuple[int, DeribitOptionsSurface | None, HyperliquidWhaleVaultMetrics | None]] = {}
+        self._latest_carry_evaluations: dict[str, CarryOpportunityEvaluation] = {}
+        self._latest_carry_signals: dict[str, SleeveSignalOutput] = {}
+        self._latest_derivatives_signals: dict[str, DerivativesAlphaSignal] = {}
+        self._latest_targets: dict[str, SleeveTarget] = {}
+        self._latest_hrp_weights: dict[str, float] = {a: 1.0 / len(ASSETS) for a in ASSETS}
 
         self._load_or_init_ledger()
 
-        self._rng: np.random.Generator = np.random.default_rng(20261031)
+        # Bar feed: Hyperliquid candles by default, scripted bars for replay and tests.
+        self._feed: BarFeed = feed or HyperliquidCandleBarFeed(coins=ASSETS)
+        self._data_availability: DataAvailability = DataAvailability()
+        self._last_waiting_log_ts: float = 0.0
+
         raw_state = initial_state or build_default_dashboard_state()
-        multi_snap = get_live_multi_asset_snapshot(coins=("BTC", "ETH", "SOL"), include_l2=True)
+        multi_snap = self._feed.snapshot()
         self._latest_market_snapshot: MultiAssetMarketSnapshot = multi_snap
-        btc_snap = multi_snap.get_asset("BTC")
-        eth_snap = multi_snap.get_asset("ETH")
-        sol_snap = multi_snap.get_asset("SOL")
-        live_anchor = btc_snap.mid_price if btc_snap else float(raw_state.dollar_bars[-1].close)
-        self._prev_asset_prices: dict[str, float] = {
-            "BTC": live_anchor,
-            "ETH": eth_snap.mid_price if eth_snap else 2244.0,
-            "SOL": sol_snap.mid_price if sol_snap else 96.65,
-        }
-        reanchored = (
-            raw_state if initial_state is not None else _reanchor_state_to_live_price(raw_state, live_anchor)
+        self._prev_asset_prices: dict[str, float] = {}
+        for coin in ASSETS:
+            a_snap = multi_snap.get_asset(coin)
+            if a_snap is not None:
+                self._prev_asset_prices[coin] = a_snap.mid_price
+
+        # Real closed-bar history (seeded from the feed) drives features, volatility and the UI window.
+        self._history_bars: list[DollarBar] = []
+        try:
+            seeded, avail = self._feed.seed_bars("BTC", seed_bars)
+            self._history_bars = list(seeded)
+            self._data_availability = avail
+            if seeded and avail.open_interest_history:
+                _persist_bars_to_parquet(
+                    seeded,
+                    self._parquet_path,
+                    bar_source="SCRIPTED-REAL" if avail.feed_source == "SCRIPTED" else avail.feed_source,
+                )
+        except Exception as exc:
+            logger.warning("Bar history seed failed (%s); starting with an empty history.", exc)
+        self._parquet_row_count: int = _persist_bars_to_parquet([], self._parquet_path, bar_source="")
+
+        self._sigma_estimator: EWMAVolatilityEstimator = EWMAVolatilityEstimator.from_bars(self._history_bars, span=96)
+
+        # Hourly HRP-CVaR risk budgets from real 1h returns (equal weights until 96 rows exist).
+        self._hourly_returns = RollingHourlyReturnMatrix(ASSETS, max_rows=720)
+        self._hrp_scheduler = HRPWeightScheduler(ASSETS)
+        try:
+            hourly = {coin: self._feed.hourly_closes(coin, hrp_seed_hours) for coin in ASSETS}
+            self._hourly_returns.seed_from_hourly_closes(hourly)
+        except Exception as exc:
+            logger.warning("Hourly return seed failed (%s); HRP will fall back to equal weights.", exc)
+        seed_ts = self._history_bars[-1].ts_close_ns if self._history_bars else multi_snap.timestamp_ns
+        self._latest_hrp_weights = self._hrp_scheduler.compute(seed_ts, self._hourly_returns.matrix(), force=True)
+        self._data_availability = self._data_availability.model_copy(
+            update={"hourly_return_rows": self._hourly_returns.n_rows}
         )
 
-        # Synchronize PnL telemetry with persistent ledger state
+        # Risk committee baseline from live funding and prices.
+        self._latest_committee_output: RiskCommitteeOutput = self._compute_initial_risk_committee(multi_snap)
+
+        # Microstructure monitors and the Stage-1 SVD + Stage-2 LightGBM worker (trained on real rows only).
+        self._vpin_monitor = RollingBVCVPINMonitor(bucket_volume=500.0, num_buckets=50)
+        self._hawkes_monitor = RecursiveHawkesMonitor(async_refit=False)
+        self._ffd_close_cfg: FFDWeightsConfig = raw_state.ffd_config
+        self._ml_worker: LightGBMMetaLabelWorker | None = None
+        self._last_retrain_ts_ns: int | None = None
+        self._last_retrain_message: str = ""
+        self._train_initial_ml_worker()
+
+        # Position lifecycle (restored from the ledger when the process restarts).
+        self._positions = PositionManager(fee_schedule=self._fee, barrier_config=self._barrier_cfg)
+        for pos in self._restored_positions:
+            self._positions.restore(pos)
+
+        self._tick_counter: int = len(self._history_bars)
+        self._auto_running: bool = False  # Wait for user to click Start Dry-Run!
+
         synced_pnl = PnLAndExecutionMetrics(
             starting_capital_usd=self._starting_capital_usd,
             net_pnl_usd=round(self._total_realized_pnl, 2),
             net_pnl_bps=round((self._total_realized_pnl / max(1.0, self._starting_capital_usd)) * 10_000.0, 1),
             gross_pnl_usd=round(self._total_realized_pnl + self._total_fees_paid_usd, 2),
             total_fees_paid_usd=round(self._total_fees_paid_usd, 2),
-            maker_fill_ratio=reanchored.pnl_metrics.maker_fill_ratio,
-            taker_fill_ratio=reanchored.pnl_metrics.taker_fill_ratio,
-            fee_savings_usd=round(self._total_fee_savings_usd, 2),
-            fee_savings_bps=reanchored.pnl_metrics.fee_savings_bps,
-            annualized_carry_apr_pct=reanchored.pnl_metrics.annualized_carry_apr_pct,
-            is_dry_run=reanchored.pnl_metrics.is_dry_run,
+            maker_fill_ratio=self._maker_fill_ratio(),
+            taker_fill_ratio=1.0 - self._maker_fill_ratio(),
+            fee_savings_usd=0.0,
+            fee_savings_bps=0.0,
+            annualized_carry_apr_pct=0.0,
+            is_dry_run=raw_state.pnl_metrics.is_dry_run,
         )
-
-        # Initial 3-model risk committee run
-        self._latest_committee_output: RiskCommitteeOutput = self._compute_initial_risk_committee(live_anchor)
-
-        self._state: DashboardTelemetryState = reanchored.model_copy(
+        self._state: DashboardTelemetryState = raw_state.model_copy(
             update={
                 "pnl_metrics": synced_pnl,
+                "ffd_config": self._ffd_close_cfg,
                 "asri_risk": self._latest_committee_output.to_systemic_risk_output(),
+                "portfolio_allocation": self._zero_allocation(),
             }
         )
-        self._tick_counter: int = len(self._state.dollar_bars)
-        self._auto_running: bool = False  # Wait for user to click Start Dry-Run!
-        self._parquet_row_count: int = 0
-        self._history_bars: list[DollarBar] = []
-
-        # Initialize real microstructure monitors & real trained Stage-1 SVD + Stage-2 LightGBM worker
-        self._vpin_monitor = RollingBVCVPINMonitor(bucket_volume=500.0, num_buckets=50)
-        self._hawkes_monitor = RecursiveHawkesMonitor(async_refit=False)
-        self._ml_worker = self._train_initial_ml_worker()
+        self._refresh_initial_state_window()
+        self._evaluate_sleeves_for_telemetry(multi_snap)
 
         init_line_1 = (
             f"[{self._now_str()}] [READY] Project Phoenix online at http://127.0.0.1:8080 | "
             f"Ledger: ${self._starting_capital_usd:,.2f} base (${self._starting_capital_usd + self._total_realized_pnl:,.2f} equity, "
-            f"{len(self._trade_history)} trades, W:{self._wins}/L:{self._losses}) | Store: {PARQUET_BARS_FILE.name}"
+            f"{len(self._trade_history)} closed trades, W:{self._wins}/L:{self._losses}, "
+            f"{len(self._positions.open_positions)} open) | Store: {self._parquet_path.name}"
         )
         init_line_2 = (
-            f"[{self._now_str()}] [M1 MAX ENGINE] Apple Silicon Metal GPU (mlx) 3-Model Risk Committee + "
-            "LightGBM/SVD active. Click '▶ Start Dry-Run' or '⚡ Step +1 Bar Now' to collect & trade."
+            f"[{self._now_str()}] [FEED] {self._data_availability.feed_source}: {len(self._history_bars)} real 15m bars seeded, "
+            f"{self._hourly_returns.n_rows} hourly return rows ({'HRP-CVaR live' if not self._hrp_scheduler.last_result_is_fallback else 'equal-weight fallback'}), "
+            f"model: {'trained' if self._ml_worker is not None else 'none (' + self._last_retrain_message + ')'}."
         )
         self._activity_log: list[str] = [init_line_1, init_line_2]
         _append_log_line(init_line_1)
         _append_log_line(init_line_2)
 
-    def _compute_initial_risk_committee(self, btc_price: float) -> RiskCommitteeOutput:
-        """Run initial baseline evaluation of the 3-model MLX Risk Committee."""
+    # ------------------------------------------------------------------ initialisation helpers
+
+    def _zero_allocation(self) -> PortfolioAllocationOutput:
+        return PortfolioAllocationOutput(
+            weights={a: 0.0 for a in ASSETS},
+            raw_unscaled_weights={a: 0.0 for a in ASSETS},
+            hrp_unsigned_weights=dict(self._latest_hrp_weights),
+            kelly_scalars={a: 0.0 for a in ASSETS},
+            regime_multiplier=1.0,
+            gross_leverage=0.0,
+            leverage_scale_factor=1.0,
+            rejected_for_fees=[],
+        )
+
+    def _maker_fill_ratio(self) -> float:
+        total = self._maker_fills + self._taker_fills
+        return (self._maker_fills / total) if total > 0 else 1.0
+
+    def _compute_initial_risk_committee(self, snap: MultiAssetMarketSnapshot) -> RiskCommitteeOutput:
+        """Run the baseline evaluation of the 3-model MLX Risk Committee on live prices and funding."""
+        prices = {coin: a.mid_price for coin in ASSETS if (a := snap.get_asset(coin)) is not None}
+        fundings = {coin: a.funding_rate_1h for coin in ASSETS if (a := snap.get_asset(coin)) is not None}
         try:
             macro_out = self._risk_sentinel.evaluate(stablecoin_depeg_bps=1.5, dvol_index=51.0)
             breadth_out = self._risk_breadth.evaluate(
-                MultiAssetTelemetry(
-                    asset_prices={
-                        "BTC": btc_price,
-                        "ETH": self._prev_asset_prices.get("ETH", 2244.0),
-                        "SOL": self._prev_asset_prices.get("SOL", 96.65),
-                    }
-                )
+                MultiAssetTelemetry(asset_prices=prices, funding_rates_1h=fundings)
+                if len(prices) == len(ASSETS)
+                else MultiAssetTelemetry()
             )
             critic_out = self._risk_critic.evaluate(
-                PortfolioStressInput(gross_leverage=1.0, vpin=0.28, hawkes_eta=0.35)
+                PortfolioStressInput(gross_leverage=0.0, vpin=0.25, hawkes_eta=0.30)
             )
             return self._risk_consensus.reconcile(macro_out, breadth_out, critic_out)
         except Exception:
-            # Deterministic neutral fallback if GPU memory or inputs are constrained
             mac_fall = MacroSentinelOutput(
                 score=18.0,
                 stablecoin_depeg_bps=1.5,
@@ -536,36 +584,53 @@ class ControlCenterStateStore:
                 )
                 self._total_fees_paid_usd = float(data.get("total_fees_paid_usd", 0.0))
                 self._total_fee_savings_usd = float(data.get("total_fee_savings_usd", 0.0))
+                self._total_funding_pnl_usd = float(data.get("total_funding_pnl_usd", 0.0))
                 self._wins = int(data.get("win_count", 0))
                 self._losses = int(data.get("loss_count", 0))
+                self._maker_fills = int(data.get("maker_fills", 0))
+                self._taker_fills = int(data.get("taker_fills", 0))
                 self._trade_history = list(data.get("trade_history", []))
-                self._forensics_history = [
-                    t for t in self._trade_history if isinstance(t, dict) and "why_did_it_trade" in t
-                ]
+                stored_forensics = data.get("forensics_history")
+                if isinstance(stored_forensics, list):
+                    self._forensics_history = list(stored_forensics)
+                else:
+                    self._forensics_history = [
+                        t for t in self._trade_history if isinstance(t, dict) and "why_did_it_trade" in t
+                    ]
                 if self._forensics_history:
                     self._latest_forensic = self._forensics_history[-1]
+                self._restored_positions = []
+                for raw_pos in data.get("open_positions", []):
+                    try:
+                        self._restored_positions.append(Position(**raw_pos))
+                    except Exception as pos_exc:
+                        logger.warning("Skipping unreadable persisted position: %s", pos_exc)
                 logger.info(
-                    "Loaded persistent account ledger from %s: base=$%s, equity=$%s, trades=%s",
+                    "Loaded persistent account ledger from %s: base=$%s, equity=$%s, closed trades=%s, open=%s",
                     self._ledger_path,
                     self._base_capital_usd,
                     self._base_capital_usd + self._total_realized_pnl,
                     len(self._trade_history),
+                    len(self._restored_positions),
                 )
                 return
             except Exception as exc:
                 logger.warning("Failed to load existing ledger from %s: %s", self._ledger_path, exc)
 
-        # Initialize brand new persistent ledger with $5,000.00 base capital
         self._base_capital_usd = 5000.0
         self._starting_capital_usd = 5000.0
         self._total_realized_pnl = 0.0
         self._total_fees_paid_usd = 0.0
         self._total_fee_savings_usd = 0.0
+        self._total_funding_pnl_usd = 0.0
         self._wins = 0
         self._losses = 0
+        self._maker_fills = 0
+        self._taker_fills = 0
         self._trade_history = []
         self._forensics_history = []
         self._latest_forensic = None
+        self._restored_positions = []
         self._persist_ledger_state_atomic()
 
     def _persist_ledger_state_atomic(self) -> None:
@@ -594,6 +659,12 @@ class ControlCenterStateStore:
                 else (round(gross_wins, 2) if gross_wins > 0 else 1.0)
             )
 
+            positions_mgr = getattr(self, "_positions", None)
+            open_positions = (
+                [p.model_dump(mode="json") for p in positions_mgr.open_positions.values()]
+                if positions_mgr is not None
+                else [p.model_dump(mode="json") for p in self._restored_positions]
+            )
             current_equity = round(self._starting_capital_usd + self._total_realized_pnl, 2)
             ledger_dict: dict[str, Any] = {
                 "account_id": "hyperliquid_paper_01",
@@ -610,12 +681,17 @@ class ControlCenterStateStore:
                 ),
                 "total_fees_paid_usd": round(self._total_fees_paid_usd, 2),
                 "total_fee_savings_usd": round(self._total_fee_savings_usd, 2),
+                "total_funding_pnl_usd": round(self._total_funding_pnl_usd, 4),
                 "total_trades": total_trades,
                 "win_count": self._wins,
                 "loss_count": self._losses,
+                "maker_fills": self._maker_fills,
+                "taker_fills": self._taker_fills,
                 "win_rate_pct": round(win_rate, 1),
                 "profit_factor": profit_factor,
                 "trade_history": self._trade_history[-200:],
+                "forensics_history": self._forensics_history[-200:],
+                "open_positions": open_positions,
                 "last_updated_iso": datetime.now(timezone.utc).isoformat(),
             }
             with open(tmp_file, "w", encoding="utf-8") as fh:
@@ -626,74 +702,105 @@ class ControlCenterStateStore:
         except Exception as exc:
             logger.error("Ledger atomic persistence error: %s", exc)
 
-    def _fit_worker_on_bars(self, train_bars: list[DollarBar]) -> LightGBMMetaLabelWorker:
-        """Fit Stage-1 SVD + Mahalanobis Gate + Stage-2 LightGBM on a sequence of DollarBars."""
+    # ------------------------------------------------------------------ model training (P0.7)
+
+    def _fit_worker_on_bars(self, train_bars: Sequence[DollarBar]) -> LightGBMMetaLabelWorker | None:
+        """Fit Stage-1 SVD + Mahalanobis Gate + Stage-2 LightGBM on real bars, or return None.
+
+        Rules (REINFORCEMENT_PLAN P0.7): the last ``vertical_barrier_bars`` labels are purged
+        because their horizon is incomplete; at least ``MIN_TRAIN_LABELLED_BARS`` labelled bars
+        are required; single-class labels skip the fit instead of fabricating labels. On any skip
+        the caller keeps the previous worker.
+        """
+        purge = self._barrier_cfg.vertical_barrier_bars
+        n_total = len(train_bars)
+        n_keep = n_total - purge
+        if n_keep < MIN_TRAIN_LABELLED_BARS:
+            self._last_retrain_message = (
+                f"{max(n_keep, 0)} labelled real bars after purging {purge}; {MIN_TRAIN_LABELLED_BARS} required"
+            )
+            logger.info("Meta-labeller fit skipped: %s.", self._last_retrain_message)
+            return None
+
         log_close = np.log(np.array([b.close for b in train_bars], dtype=np.float64))
-        self._ffd_close_cfg = calibrate_optimal_d(log_close, split_id="live_parquet_split")
-        snaps = compute_positioning_snapshots(train_bars, close_ffd_config=self._ffd_close_cfg)
+        ffd_cfg = calibrate_optimal_d(log_close, split_id="live_parquet_split")
+        snaps = compute_positioning_snapshots(train_bars, close_ffd_config=ffd_cfg)
         x_cont, bin_flags, prim_dirs = extract_continuous_and_binary_from_snapshots(snaps)
 
-        labeler = FeeAdjustedTripleBarrierLabeler(TripleBarrierConfig())
+        labeler = FeeAdjustedTripleBarrierLabeler(self._barrier_cfg)
         labels = labeler.label_bars(train_bars, primary_directions=prim_dirs)
-        y_meta = np.array([lbl.meta_label for lbl in labels], dtype=np.int64)
-        if np.unique(y_meta).size < 2:
-            half = max(1, len(y_meta) // 3)
-            y_meta[:half] = 1
-            y_meta[half : 2 * half] = 0
+        y_meta = np.array([lbl.meta_label for lbl in labels], dtype=np.int64)[:n_keep]
+        x_train = x_cont[:n_keep]
+        flags_train = bin_flags[:n_keep]
 
-        worker = LightGBMMetaLabelWorker(di_threshold=3.50, n_jobs=4)
-        worker.fit(x_cont, y_meta, liquidation_exhaustion_flag_train=bin_flags)
+        classes = np.unique(y_meta)
+        if classes.size < 2:
+            self._last_retrain_message = (
+                f"labels single-class ({int(classes[0])}) over {n_keep} bars; retrain skipped, previous model retained"
+            )
+            logger.warning("Meta-labeller fit skipped: %s.", self._last_retrain_message)
+            return None
+
+        sigma_series = np.concatenate(
+            ([1e-4], compute_ewma_volatility(np.diff(log_close), span=96))
+        )[:n_keep]
+
+        worker = LightGBMMetaLabelWorker(di_threshold=3.50, n_jobs=4, fee_schedule=self._fee)
+        worker.fit(
+            x_train,
+            y_meta,
+            liquidation_exhaustion_flag_train=flags_train,
+            sigma_bar_train=sigma_series,
+        )
+        self._ffd_close_cfg = ffd_cfg
+        pos_rate = float(np.mean(y_meta))
+        self._last_retrain_message = f"fitted on {n_keep} labelled real bars (positive rate {pos_rate:.1%})"
         return worker
 
-    def _train_initial_ml_worker(self) -> LightGBMMetaLabelWorker:
-        """Seed Parquet dataset with real Bybit V5 15m bars (or fallback) and train initial ML worker."""
-        bybit_bars = _fetch_initial_bybit_15m_history(self._rng)
-        if len(bybit_bars) >= 60:
-            warmup_bars = bybit_bars
-        else:
-            rng = np.random.default_rng(42)
-            warmup_bars = []
-            px = float(self._state.dollar_bars[-1].close)
-            oi = 68_500.0
-            base_ts = 1_730_000_000_000_000_000
-            step_ns = 900_000_000_000
-            for i in range(80):
-                r = float(rng.normal(0.0002, 0.0055))
-                open_p = px
-                close_p = max(1000.0, open_p * (1.0 + r))
-                high_p = max(open_p, close_p) * (1.0 + abs(float(rng.normal(0.0, 0.002))))
-                low_p = min(open_p, close_p) * (1.0 - abs(float(rng.normal(0.0, 0.002))))
-                vol = float(rng.uniform(180.0, 520.0))
-                dvol = vol * close_p
-                buy_frac = float(rng.uniform(0.38, 0.62))
-                oi = max(10_000.0, oi * (1.0 + float(rng.normal(0.0003, 0.012))))
-                warmup_bars.append(
-                    DollarBar(
-                        instrument_id="BTCUSDT-PERP",
-                        horizon_label="15m",
-                        ts_open_ns=base_ts + i * step_ns,
-                        ts_close_ns=base_ts + (i + 1) * step_ns,
-                        open=open_p,
-                        high=high_p,
-                        low=low_p,
-                        close=close_p,
-                        volume=vol,
-                        dollar_volume=dvol,
-                        buy_dollar_volume=dvol * buy_frac,
-                        sell_dollar_volume=dvol * (1.0 - buy_frac),
-                        open_interest=oi,
-                        funding_rate_8h=float(rng.normal(0.0002, 0.0004)),
-                        mark_price=close_p * (1.0 + float(rng.normal(0.0002, 0.0005))),
-                        spot_price=close_p,
-                        liquidation_volume_usd=float(rng.exponential(150_000.0)),
-                        tick_count=3500,
-                    )
-                )
-                px = close_p
+    def _train_initial_ml_worker(self) -> None:
+        """Train the initial worker from the Parquet store of real bars; otherwise run without a model."""
+        training_bars = _load_training_bars_from_parquet(self._parquet_path)
+        worker: LightGBMMetaLabelWorker | None = None
+        try:
+            worker = self._fit_worker_on_bars(training_bars)
+        except Exception as exc:
+            self._last_retrain_message = f"fit error: {exc}"
+            logger.warning("Initial meta-labeller fit failed: %s", exc)
+        if worker is None and len(self._history_bars) >= 16:
+            # No model: still freeze an FFD configuration on the real history so features are stable.
+            try:
+                log_close = np.log(np.array([b.close for b in self._history_bars], dtype=np.float64))
+                self._ffd_close_cfg = calibrate_optimal_d(log_close, split_id="live_history_split")
+            except Exception as exc:
+                logger.warning("FFD calibration on history failed (%s); default weights retained.", exc)
+        self._ml_worker = worker
+        if self._history_bars:
+            self._last_retrain_ts_ns = self._history_bars[-1].ts_close_ns
 
-        self._history_bars = list(warmup_bars)
-        self._parquet_row_count = _persist_bars_to_parquet(self._history_bars)
-        return self._fit_worker_on_bars(self._history_bars)
+    def _maybe_retrain(self, ts_close_ns: int) -> None:
+        """Retrain on the daily schedule from the Parquet store; keep the previous worker on any skip."""
+        if self._last_retrain_ts_ns is None:
+            self._last_retrain_ts_ns = ts_close_ns
+            return
+        if ts_close_ns - self._last_retrain_ts_ns < RETRAIN_INTERVAL_NS:
+            return
+        self._last_retrain_ts_ns = ts_close_ns
+        training_bars = _load_training_bars_from_parquet(self._parquet_path)
+        try:
+            worker = self._fit_worker_on_bars(training_bars)
+        except Exception as exc:
+            worker = None
+            self._last_retrain_message = f"fit error: {exc}"
+            logger.warning("Scheduled meta-labeller retrain failed: %s", exc)
+        if worker is not None:
+            self._ml_worker = worker
+            msg = f"[{self._now_str()} • RETRAIN] Refitted SVD + Mahalanobis Gate + LightGBM: {self._last_retrain_message}."
+        else:
+            msg = f"[{self._now_str()} • RETRAIN SKIPPED] {self._last_retrain_message}."
+        self._activity_log.append(msg)
+        _append_log_line(msg)
+
+    # ------------------------------------------------------------------ properties
 
     @property
     def state(self) -> DashboardTelemetryState:
@@ -702,12 +809,12 @@ class ControlCenterStateStore:
 
     @property
     def tick_counter(self) -> int:
-        """Return the current simulation bar counter."""
+        """Return the number of real closed bars in the engine's history."""
         return self._tick_counter
 
     @property
     def auto_running(self) -> bool:
-        """Return True when the background Dry-Run ticker is actively advancing bars."""
+        """Return True when the background Dry-Run poller is active."""
         return self._auto_running
 
     @property
@@ -722,12 +829,12 @@ class ControlCenterStateStore:
 
     @property
     def forensics_history(self) -> list[dict[str, Any]]:
-        """Return the trade forensics history."""
+        """Return the per-bar decision records."""
         return self._forensics_history
 
     @property
     def latest_forensic(self) -> dict[str, Any] | None:
-        """Return the most recent trade forensic record."""
+        """Return the most recent decision record."""
         return self._latest_forensic
 
     @property
@@ -736,38 +843,122 @@ class ControlCenterStateStore:
         return self._latest_committee_output
 
     @property
+    def data_availability(self) -> DataAvailability:
+        """Which live inputs are backed by a real feed."""
+        return self._data_availability
+
+    @property
+    def history_bars(self) -> list[DollarBar]:
+        """Real closed bars held in memory (seed plus live)."""
+        return list(self._history_bars)
+
+    @property
+    def ml_worker(self) -> LightGBMMetaLabelWorker | None:
+        """The trained meta-labelling worker, or None when no honest model exists yet."""
+        return self._ml_worker
+
+    @property
+    def position_manager(self) -> PositionManager:
+        """Open book and realised trades."""
+        return self._positions
+
+    @property
+    def hrp_weights(self) -> dict[str, float]:
+        """Latest unsigned HRP-CVaR risk budgets."""
+        return dict(self._latest_hrp_weights)
+
+    @property
+    def latest_targets(self) -> dict[str, SleeveTarget]:
+        """Signed sleeve targets from the latest processed bar."""
+        return dict(self._latest_targets)
+
+    @property
+    def sigma_bar(self) -> float:
+        """Current EWMA (span 96) volatility of 15m log returns."""
+        return self._sigma_estimator.value
+
+    @property
     def sleeve_telemetry(self) -> dict[str, Any]:
-        """Return telemetry from both Funding Carry and Derivatives Alpha sleeves."""
-        snap = self.latest_market_snapshot
-        btc_snap = snap.get_asset("BTC") if snap else None
-        f1h_btc = btc_snap.funding_rate_1h if btc_snap else 0.000012
-        apr_carry = abs(f1h_btc) * 24.0 * 365.0 * 100.0
+        """Latest real evaluations of the funding-carry and derivatives-alpha sleeves."""
+        btc_eval = self._latest_carry_evaluations.get("BTC")
+        btc_deriv = self._latest_derivatives_signals.get("BTC")
+        cached_btc = self._derivatives_inputs_cache.get("BTC")
+        surface_btc = cached_btc[1] if cached_btc is not None else None
+        vault_btc = cached_btc[2] if cached_btc is not None else None
+        open_carry = [p for p in self._positions.open_positions.values() if p.sleeve_id == SLEEVE_FUNDING_CARRY]
+        open_deriv = [p for p in self._positions.open_positions.values() if p.sleeve_id == SLEEVE_DERIVATIVES]
+
+        if btc_deriv is not None:
+            if btc_deriv.term_structure_slope > self._derivatives_alpha_sleeve.config.term_structure_contango_threshold:
+                term_label = "CONTANGO"
+            elif btc_deriv.term_structure_slope < self._derivatives_alpha_sleeve.config.term_structure_backwardation_threshold:
+                term_label = "BACKWARDATION"
+            else:
+                term_label = "FLAT"
+            crowd: str = btc_deriv.hlp_vault_crowding
+            vulnerability = "ELEVATED" if crowd != "BALANCED" else "LOW"
+        else:
+            term_label = "UNAVAILABLE"
+            crowd = "UNKNOWN"
+            vulnerability = "UNKNOWN"
 
         return {
             "funding_carry": {
-                "sleeve_id": "funding_carry",
-                "active_strategy": "DELTA_NEUTRAL_SPOT_PERP",
+                "sleeve_id": SLEEVE_FUNDING_CARRY,
+                "active_strategy": btc_eval.direction.value if btc_eval is not None else CarryDirection.FLAT.value,
                 "hyperliquid_1h_settlement_active": True,
                 "routing_tag": "ALO_POST_ONLY",
-                "annualized_apr_pct": round(apr_carry, 2),
-                "maker_rebate_bps": 1.5,
-                "taker_fee_avoided_bps": 4.5,
-                "cross_venue_spread_bps": 8.4,
-                "venue_pair": "HYPERLIQUID_vs_BYBIT",
-                "breakeven_hours": 12.0,
-                "status": "HARVESTING_ACTIVE",
+                "annualized_apr_pct": round(btc_eval.annualized_funding_apr * 100.0, 2) if btc_eval is not None else 0.0,
+                "funding_rate_1h": btc_eval.funding_rate_1h if btc_eval is not None else 0.0,
+                "maker_rebate_bps": self._fee.maker_bps,
+                "taker_fee_avoided_bps": round(self._fee.taker_bps - self._fee.maker_bps, 2),
+                "cross_venue_spread_bps": None,
+                "venue_pair": "UNAVAILABLE (no second funding venue feed)",
+                "breakeven_hours": round(min(btc_eval.breakeven_hours, 9999.0), 1) if btc_eval is not None else None,
+                "expected_net_carry_bps": round(btc_eval.expected_net_carry_bps, 2) if btc_eval is not None else 0.0,
+                "is_actionable": btc_eval.is_actionable if btc_eval is not None else False,
+                "reason": btc_eval.reason if btc_eval is not None else "No evaluation yet.",
+                "open_positions": len(open_carry),
+                "status": "HARVESTING_ACTIVE" if open_carry else "FLAT",
+                "evaluations": {
+                    coin: ev.model_dump(mode="json") for coin, ev in self._latest_carry_evaluations.items()
+                },
             },
             "derivatives_alpha": {
-                "sleeve_id": "derivatives_alpha",
-                "deribit_25d_skew": 0.024,
-                "term_structure_slope": 0.008,
-                "term_structure_label": "CONTANGO",
-                "net_dealer_gex_usd": 42_500_000.0,
-                "gex_regime": "PINNING_STABILITY",
-                "hlp_vault_address": "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
-                "hlp_crowding": "BALANCED",
-                "counterparty_vulnerability": "LOW",
-                "status": "ALPHA_SIGNALS_ONLINE",
+                "sleeve_id": SLEEVE_DERIVATIVES,
+                "deribit_25d_skew": btc_deriv.skew_25d if btc_deriv is not None else 0.0,
+                "term_structure_slope": btc_deriv.term_structure_slope if btc_deriv is not None else 0.0,
+                "term_structure_label": term_label,
+                "net_dealer_gex_usd": surface_btc.net_gex_usd if surface_btc is not None else 0.0,
+                "gex_regime": btc_deriv.gex_regime if btc_deriv is not None else "UNAVAILABLE",
+                "hlp_vault_address": vault_btc.vault_address if vault_btc is not None else self._derivatives_alpha_sleeve.config.vault_address,
+                "hlp_crowding": crowd,
+                "counterparty_vulnerability": vulnerability,
+                "primary_direction": btc_deriv.primary_direction if btc_deriv is not None else 0,
+                "p_meta": btc_deriv.p_meta if btc_deriv is not None else 0.5,
+                "expected_gross_edge_bps": btc_deriv.expected_gross_edge_bps if btc_deriv is not None else 0.0,
+                "open_positions": len(open_deriv),
+                "status": (
+                    "ALPHA_SIGNALS_ONLINE"
+                    if self._data_availability.options_surface or self._data_availability.hlp_vault
+                    else "INPUTS_UNAVAILABLE"
+                ),
+                "signals": {
+                    coin: sig.model_dump(mode="json") for coin, sig in self._latest_derivatives_signals.items()
+                },
+            },
+            "meta_labeller": {
+                "sleeve_id": SLEEVE_META_LABELLER,
+                "model_available": self._ml_worker is not None,
+                "last_retrain_message": self._last_retrain_message,
+                "sigma_bar_ewma96": round(self._sigma_estimator.value, 6),
+            },
+            "hrp_weights": dict(self._latest_hrp_weights),
+            "hrp_is_fallback": self._hrp_scheduler.last_result_is_fallback,
+            "hourly_return_rows": self._hourly_returns.n_rows,
+            "data_availability": self._data_availability.model_dump(mode="json"),
+            "sleeve_attribution": {
+                k: v.model_dump(mode="json") for k, v in self._positions.sleeve_attribution(self._current_marks()).items()
             },
         }
 
@@ -777,6 +968,8 @@ class ControlCenterStateStore:
         total_trades = self._wins + self._losses
         win_rate = (self._wins / total_trades * 100.0) if total_trades > 0 else 0.0
         curr_eq = round(self._starting_capital_usd + self._total_realized_pnl, 2)
+        marks = self._current_marks()
+        unrealized = round(self._positions.total_unrealized_pnl_usd(marks), 2)
         return {
             "account_id": "hyperliquid_paper_01",
             "base_capital_usd": self._starting_capital_usd,
@@ -792,30 +985,390 @@ class ControlCenterStateStore:
             ),
             "total_fees_paid_usd": round(self._total_fees_paid_usd, 2),
             "total_fee_savings_usd": round(self._total_fee_savings_usd, 2),
+            "total_funding_pnl_usd": round(self._total_funding_pnl_usd, 4),
             "total_trades": total_trades,
             "win_count": self._wins,
             "loss_count": self._losses,
             "win_rate_pct": round(win_rate, 1),
             "trade_count": len(self._trade_history),
+            "open_positions": len(self._positions.open_positions),
+            "unrealized_pnl_usd": unrealized,
+            "marked_equity_usd": round(curr_eq + unrealized, 2),
+            "maker_fill_ratio": round(self._maker_fill_ratio(), 4),
         }
 
     @staticmethod
     def _now_str() -> str:
         return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
+    # ------------------------------------------------------------------ market context helpers
+
+    def _bar_source_tag(self, snap: MultiAssetMarketSnapshot) -> str:
+        """Tag persisted bars with the feed that produced them; only real-feed tags are used for training."""
+        feed_avail = self._feed.availability
+        if feed_avail.feed_source == "SCRIPTED":
+            return "SCRIPTED-REAL" if feed_avail.open_interest_history else "SCRIPTED-SYNTHETIC"
+        return str(snap.feed_source)
+
+    def _current_marks(self) -> dict[str, BarMarks]:
+        snap = self.latest_market_snapshot
+        marks: dict[str, BarMarks] = {}
+        for coin in ASSETS:
+            a_snap = snap.get_asset(coin) if snap is not None else None
+            if a_snap is not None:
+                marks[coin] = BarMarks(
+                    asset=coin,
+                    bar=None,
+                    mark_price=a_snap.mark_price,
+                    spot_price=a_snap.oracle_price,
+                    funding_rate_1h=a_snap.funding_rate_1h,
+                )
+            elif coin == "BTC" and self._history_bars:
+                last = self._history_bars[-1]
+                marks[coin] = BarMarks(asset=coin, bar=None, mark_price=last.mark_price, spot_price=last.spot_price)
+        return marks
+
+    def _build_marks(self, bars_by_coin: Mapping[str, DollarBar], snap: MultiAssetMarketSnapshot) -> dict[str, BarMarks]:
+        marks: dict[str, BarMarks] = {}
+        for coin in ASSETS:
+            bar = bars_by_coin.get(coin)
+            a_snap = snap.get_asset(coin)
+            if bar is None and a_snap is None:
+                continue
+            if bar is not None:
+                mark_px, spot_px, f1h = bar.mark_price, bar.spot_price, bar.funding_rate_1h
+                bar_hours = (bar.ts_close_ns - bar.ts_open_ns) / 3.6e12
+            elif a_snap is not None:
+                mark_px, spot_px, f1h = a_snap.mark_price, a_snap.oracle_price, a_snap.funding_rate_1h
+                bar_hours = 0.25
+            else:
+                continue
+            if mark_px <= 0.0 or spot_px <= 0.0:
+                continue
+            marks[coin] = BarMarks(
+                asset=coin,
+                bar=bar,
+                mark_price=mark_px,
+                spot_price=spot_px,
+                funding_rate_1h=f1h,
+                bar_hours=max(bar_hours, 1e-6),
+            )
+        return marks
+
+    def _derivatives_inputs(
+        self, coin: str, ts_ns: int
+    ) -> tuple[DeribitOptionsSurface | None, HyperliquidWhaleVaultMetrics | None]:
+        """Options surface and HLP vault metrics for ``coin`` with a 5-minute TTL cache."""
+        cached = self._derivatives_inputs_cache.get(coin)
+        if cached is not None and ts_ns - cached[0] < DERIVATIVES_INPUT_TTL_NS:
+            return cached[1], cached[2]
+        surface: DeribitOptionsSurface | None = None
+        vault: HyperliquidWhaleVaultMetrics | None = None
+        if self._fetch_derivatives_inputs:
+            try:
+                surface = self._derivatives_alpha_sleeve.fetch_deribit_options_surface_sync(coin)
+            except Exception as exc:
+                logger.debug("Options surface fetch failed for %s: %s", coin, exc)
+            vault_cached = self._derivatives_inputs_cache.get("__vault__")
+            if vault_cached is not None and ts_ns - vault_cached[0] < DERIVATIVES_INPUT_TTL_NS:
+                vault = vault_cached[2]
+            else:
+                try:
+                    vault = self._derivatives_alpha_sleeve.fetch_hyperliquid_vault_positioning_sync()
+                except Exception as exc:
+                    logger.debug("HLP vault fetch failed: %s", exc)
+                self._derivatives_inputs_cache["__vault__"] = (ts_ns, None, vault)
+        self._derivatives_inputs_cache[coin] = (ts_ns, surface, vault)
+        return surface, vault
+
+    def _evaluate_sleeves(
+        self,
+        snap: MultiAssetMarketSnapshot,
+        bars_by_coin: Mapping[str, DollarBar],
+        committee: RiskCommitteeOutput,
+        ts_ns: int,
+    ) -> None:
+        """Run both sleeves for every asset from live inputs and keep the evaluations for telemetry."""
+        carry_evals: dict[str, CarryOpportunityEvaluation] = {}
+        carry_signals: dict[str, SleeveSignalOutput] = {}
+        deriv_signals: dict[str, DerivativesAlphaSignal] = {}
+        surface_seen = False
+        vault_seen = False
+        for coin in ASSETS:
+            a_snap: AssetMarketSnapshot | None = snap.get_asset(coin)
+            if a_snap is None:
+                continue
+            carry_eval = self._funding_carry_sleeve.evaluate_from_snapshot(
+                a_snap,
+                fee_schedule=self._fee,
+                asri_score=committee.consensus_risk_score,
+                tail_risk_flag=committee.tail_risk_flag,
+                regime_mode=self._state.regime_mode,
+                target_notional_weight=CARRY_TARGET_NOTIONAL_WEIGHT,
+            )
+            carry_evals[coin] = carry_eval
+            carry_signals[coin] = self._funding_carry_sleeve.generate_sleeve_signal(carry_eval)
+
+            surface, vault = self._derivatives_inputs(coin, ts_ns)
+            if surface is not None and (surface.skew_25d != 0.0 or surface.net_gex_usd != 0.0 or surface.term_structure_slope != 0.0):
+                surface_seen = True
+            if vault is not None and (vault.net_delta_usd != 0.0 or vault.hlp_crowding != "BALANCED"):
+                vault_seen = True
+            deriv_signals[coin] = self._derivatives_alpha_sleeve.generate_alpha_signal(
+                options_surface=surface,
+                vault_metrics=vault,
+                bar=bars_by_coin.get(coin),
+                instrument_id=coin,
+                timestamp_ns=ts_ns,
+            )
+        self._latest_carry_evaluations = carry_evals
+        self._latest_carry_signals = carry_signals
+        self._latest_derivatives_signals = deriv_signals
+        self._data_availability = self._data_availability.model_copy(
+            update={"options_surface": surface_seen, "hlp_vault": vault_seen}
+        )
+
+    def _evaluate_sleeves_for_telemetry(self, snap: MultiAssetMarketSnapshot) -> None:
+        if snap.feed_source == "SIMULATED-FALLBACK":
+            return
+        try:
+            self._evaluate_sleeves(snap, {}, self._latest_committee_output, snap.timestamp_ns)
+        except Exception as exc:
+            logger.warning("Initial sleeve evaluation failed: %s", exc)
+
+    # ------------------------------------------------------------------ allocation (P0.1 / P0.2 / P0.3)
+
+    def _build_targets(
+        self,
+        meta: MetaPredictionOutput,
+        sigma_bar: float,
+        regime_multiplier: float,
+        regime_mode: ExecutionRegimeMode,
+    ) -> tuple[dict[str, SleeveTarget], PortfolioAllocationOutput, dict[str, float]]:
+        """Turn sleeve signals into signed per-(sleeve, asset) targets through the governing equation.
+
+        Directional sleeves receive the committee multiplier only in DIRECTIONAL_PLUS_CARRY mode;
+        the carry sleeve is allowed in DIRECTIONAL_PLUS_CARRY and CARRY_ONLY_FALLBACK. Everything is
+        zero in PAUSED_ENTRIES (existing positions still manage their exits) and EMERGENCY_FLATTENED.
+        """
+        hrp = self._latest_hrp_weights
+        directional_m = regime_multiplier if regime_mode == ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY else 0.0
+        carry_m = (
+            regime_multiplier
+            if regime_mode in (ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY, ExecutionRegimeMode.CARRY_ONLY_FALLBACK)
+            else 0.0
+        )
+
+        ub, lb = compute_effective_barriers(max(sigma_bar, 0.0), self._barrier_cfg)
+        meta_expected_bps = (meta.p_meta * ub - (1.0 - meta.p_meta) * lb) * 10_000.0
+        meta_inputs = [
+            AssetAllocationInput(
+                asset_id="BTC",
+                y_primary=meta.effective_direction,
+                w_hrp=hrp["BTC"],
+                p_meta=meta.p_meta,
+                expected_gross_return_bps=meta_expected_bps,
+                fee_schedule=self._fee,
+                epistemic_gate_passed=meta.epistemic_gate_passed,
+            )
+        ]
+        deriv_inputs = [
+            AssetAllocationInput(
+                asset_id=coin,
+                y_primary=sig.primary_direction,
+                w_hrp=hrp[coin],
+                p_meta=sig.p_meta,
+                expected_gross_return_bps=sig.expected_gross_edge_bps,
+                fee_schedule=self._fee,
+                epistemic_gate_passed=True,
+            )
+            for coin, sig in self._latest_derivatives_signals.items()
+        ]
+        carry_inputs = [
+            AssetAllocationInput(
+                asset_id=coin,
+                y_primary=1 if sig.direction > 0 else (-1 if sig.direction < 0 else 0),
+                w_hrp=hrp[coin],
+                p_meta=sig.meta_probability,
+                expected_gross_return_bps=sig.raw_expected_return,
+                fee_schedule=self._fee,
+                epistemic_gate_passed=True,
+            )
+            for coin, sig in self._latest_carry_signals.items()
+        ]
+
+        meta_alloc = compute_signed_target_weights(meta_inputs, regime_multiplier=directional_m, max_gross_leverage=MAX_GROSS_LEVERAGE)
+        deriv_alloc = (
+            compute_signed_target_weights(deriv_inputs, regime_multiplier=directional_m, max_gross_leverage=MAX_GROSS_LEVERAGE)
+            if deriv_inputs
+            else None
+        )
+        carry_alloc = (
+            compute_signed_target_weights(carry_inputs, regime_multiplier=carry_m, max_gross_leverage=MAX_GROSS_LEVERAGE)
+            if carry_inputs
+            else None
+        )
+
+        targets: dict[str, SleeveTarget] = {}
+        targets[position_key(SLEEVE_META_LABELLER, "BTC")] = SleeveTarget(
+            sleeve_id=SLEEVE_META_LABELLER,
+            asset="BTC",
+            weight=meta_alloc.weights.get("BTC", 0.0),
+            hedged=False,
+            p_meta=meta.p_meta,
+            expected_gross_return_bps=meta_expected_bps,
+            reason=(
+                f"LightGBM p_meta={meta.p_meta:.3f}, direction={meta.effective_direction:+d}, "
+                f"DI={meta.mahalanobis_di:.2f} (gate {'open' if meta.epistemic_gate_passed else 'closed'})"
+            ),
+        )
+        if deriv_alloc is not None:
+            for coin, sig in self._latest_derivatives_signals.items():
+                targets[position_key(SLEEVE_DERIVATIVES, coin)] = SleeveTarget(
+                    sleeve_id=SLEEVE_DERIVATIVES,
+                    asset=coin,
+                    weight=deriv_alloc.weights.get(coin, 0.0),
+                    hedged=False,
+                    p_meta=sig.p_meta,
+                    expected_gross_return_bps=sig.expected_gross_edge_bps,
+                    reason=(
+                        f"derivatives alpha direction={sig.primary_direction:+d}, p={sig.p_meta:.3f}, "
+                        f"skew={sig.skew_25d:+.4f}, gex={sig.gex_regime}, hlp={sig.hlp_vault_crowding}"
+                    ),
+                )
+        if carry_alloc is not None:
+            for coin, carry_sig in self._latest_carry_signals.items():
+                ev = self._latest_carry_evaluations.get(coin)
+                hedged = ev is not None and ev.direction == CarryDirection.SPOT_LONG_PERP_SHORT
+                w = carry_alloc.weights.get(coin, 0.0)
+                targets[position_key(SLEEVE_FUNDING_CARRY, coin)] = SleeveTarget(
+                    sleeve_id=SLEEVE_FUNDING_CARRY,
+                    asset=coin,
+                    weight=abs(w) if hedged else w,
+                    hedged=hedged,
+                    p_meta=carry_sig.meta_probability,
+                    expected_gross_return_bps=carry_sig.raw_expected_return,
+                    reason=ev.reason if ev is not None else "carry evaluation unavailable",
+                )
+
+        # Global gross leverage cap across sleeves (hedged carry counts both legs).
+        gross = sum(abs(t.weight) * (2.0 if t.hedged else 1.0) for t in targets.values())
+        scale = MAX_GROSS_LEVERAGE / gross if gross > MAX_GROSS_LEVERAGE else 1.0
+        if scale < 1.0:
+            targets = {k: t.model_copy(update={"weight": t.weight * scale}) for k, t in targets.items()}
+            gross = MAX_GROSS_LEVERAGE
+
+        per_asset_directional: dict[str, float] = {a: 0.0 for a in ASSETS}
+        kelly: dict[str, float] = {a: 0.0 for a in ASSETS}
+        raw_unscaled: dict[str, float] = {a: 0.0 for a in ASSETS}
+        for t in targets.values():
+            if not t.hedged:
+                per_asset_directional[t.asset] += t.weight
+                raw_unscaled[t.asset] += t.weight / scale if scale > 0.0 else 0.0
+            kelly[t.asset] = max(kelly[t.asset], compute_fractional_kelly(t.p_meta))
+        rejected = sorted(
+            set(meta_alloc.rejected_for_fees)
+            | set(deriv_alloc.rejected_for_fees if deriv_alloc is not None else [])
+            | set(carry_alloc.rejected_for_fees if carry_alloc is not None else [])
+        )
+        allocation = PortfolioAllocationOutput(
+            weights={a: round(w, 6) for a, w in per_asset_directional.items()},
+            raw_unscaled_weights={a: round(w, 6) for a, w in raw_unscaled.items()},
+            hrp_unsigned_weights=dict(hrp),
+            kelly_scalars=kelly,
+            regime_multiplier=regime_multiplier,
+            gross_leverage=min(round(gross, 6), MAX_GROSS_LEVERAGE),
+            leverage_scale_factor=scale,
+            rejected_for_fees=rejected,
+        )
+        return targets, allocation, kelly
+
+    # ------------------------------------------------------------------ UI state helpers
+
+    def _barrier_label_for_bar(self, bar: DollarBar, bar_index: int, sigma_bar: float, closed: Sequence[ClosedTradeRecord]) -> TripleBarrierLabel:
+        ub, lb = compute_effective_barriers(max(sigma_bar, 0.0), self._barrier_cfg)
+        touched: Literal["PROFIT", "STOP", "VERTICAL", "NONE"] = "NONE"
+        net_ret = 0.0
+        direction: Literal[-1, 0, 1] = 0
+        for rec in closed:
+            if rec.asset != "BTC" or rec.hedged:
+                continue
+            direction = rec.side
+            net_ret = rec.net_return_bps * 1e-4
+            if rec.exit_reason == PositionExitReason.PROFIT_BARRIER:
+                touched = "PROFIT"
+            elif rec.exit_reason == PositionExitReason.STOP_BARRIER:
+                touched = "STOP"
+            else:
+                touched = "VERTICAL"
+            break
+        return TripleBarrierLabel(
+            bar_index=bar_index,
+            primary_direction=direction,
+            gross_return=round(net_ret, 6),
+            net_return=round(net_ret, 6),
+            fee_cost=round(self._fee.roundtrip_maker_plus_slippage_bps * 1e-4, 6),
+            funding_cost=0.0,
+            upper_barrier=round(bar.close * (1.0 + ub), 2),
+            lower_barrier=round(bar.close * (1.0 - lb), 2),
+            hit_bar_offset=0,
+            barrier_touched=touched,
+            meta_label=1 if touched == "PROFIT" else 0,
+        )
+
+    def _refresh_initial_state_window(self) -> None:
+        """Replace the placeholder UI window with the tail of the real seeded history."""
+        if len(self._history_bars) < 2:
+            return
+        window = self._history_bars[-UI_WINDOW_BARS:]
+        try:
+            snaps = compute_positioning_snapshots(self._history_bars[-FEATURE_WINDOW_BARS:], close_ffd_config=self._ffd_close_cfg)
+        except Exception as exc:
+            logger.warning("Initial positioning snapshot failed: %s", exc)
+            return
+        pos_window = snaps[-len(window):]
+        sigma_series = np.concatenate(
+            ([1e-4], compute_ewma_volatility(np.diff(np.log(np.array([b.close for b in self._history_bars], dtype=np.float64))), span=96))
+        )
+        first_idx = len(self._history_bars) - len(window)
+        barriers = [
+            self._barrier_label_for_bar(b, first_idx + i, float(sigma_series[first_idx + i]), [])
+            for i, b in enumerate(window)
+        ]
+        metas = [
+            _neutral_meta_prediction(b.instrument_id, b.ts_close_ns, "history") for b in window
+        ]
+        hawkes = list(self._state.hawkes_history[-len(window):]) or [self._state.hawkes_state]
+        while len(hawkes) < len(window):
+            hawkes.insert(0, hawkes[0])
+        self._state = self._state.model_copy(
+            update={
+                "dollar_bars": window,
+                "positioning_signals": pos_window,
+                "barrier_labels": barriers,
+                "meta_predictions": metas,
+                "hawkes_history": hawkes,
+            }
+        )
+
+    # ------------------------------------------------------------------ controls
+
     def reset_account(self, starting_capital_usd: float = 5_000.0) -> ControlActionResult:
-        """Reset total profit to $0.00 and set the paper-trading starting capital."""
+        """Reset total profit to $0.00, close the paper book, and set the starting capital."""
         self._starting_capital_usd = round(float(starting_capital_usd), 2)
         self._base_capital_usd = self._starting_capital_usd
         self._total_realized_pnl = 0.0
         self._total_fees_paid_usd = 0.0
         self._total_fee_savings_usd = 0.0
+        self._total_funding_pnl_usd = 0.0
         self._wins = 0
         self._losses = 0
+        self._maker_fills = 0
+        self._taker_fills = 0
         self._trade_history = []
         self._forensics_history = []
         self._latest_forensic = None
-        self._tick_counter = 12
+        self._positions = PositionManager(fee_schedule=self._fee, barrier_config=self._barrier_cfg)
         self._persist_ledger_state_atomic()
 
         base_state = build_default_dashboard_state(
@@ -832,16 +1385,16 @@ class ControlCenterStateStore:
             net_pnl_bps=0.0,
             gross_pnl_usd=0.00,
             total_fees_paid_usd=0.00,
-            maker_fill_ratio=0.914,
-            taker_fill_ratio=0.086,
+            maker_fill_ratio=1.0,
+            taker_fill_ratio=0.0,
             fee_savings_usd=0.00,
             fee_savings_bps=0.0,
-            annualized_carry_apr_pct=14.8,
+            annualized_carry_apr_pct=self._state.pnl_metrics.annualized_carry_apr_pct,
             is_dry_run=True,
         )
         msg = (
             f"[{self._now_str()}] 🔄 ACCOUNT RESET: Starting Paper Capital set to "
-            f"${self._starting_capital_usd:,.2f} | Total Profit cleared to $0.00 (0.0 bps) | Ledger persisted."
+            f"${self._starting_capital_usd:,.2f} | Total Profit cleared to $0.00 (0.0 bps) | Open book cleared | Ledger persisted."
         )
         self._activity_log.append(msg)
         _append_log_line(msg)
@@ -849,11 +1402,15 @@ class ControlCenterStateStore:
         self._state = base_state.model_copy(
             update={
                 "pnl_metrics": fresh_pnl,
+                "ffd_config": self._ffd_close_cfg,
+                "asri_risk": self._state.asri_risk,
+                "hawkes_state": self._state.hawkes_state,
                 "dollar_bars": self._state.dollar_bars,
                 "positioning_signals": self._state.positioning_signals,
                 "barrier_labels": self._state.barrier_labels,
                 "meta_predictions": self._state.meta_predictions,
                 "hawkes_history": self._state.hawkes_history,
+                "portfolio_allocation": self._zero_allocation(),
                 "last_control_message": msg,
             }
         )
@@ -876,173 +1433,110 @@ class ControlCenterStateStore:
             ledger_summary=self.ledger_summary,
         )
 
+    # ------------------------------------------------------------------ the tick
+
     def step_simulation_tick(self) -> ControlActionResult:
-        """Advance 1 bar using real FFD + SVD + LightGBM inference and real mark-to-market PnL."""
+        """Poll the feed; process exactly one new closed 15m bar if one exists, else report waiting."""
+        snap = self._feed.snapshot()
+        self._latest_market_snapshot = snap
+
+        if snap.feed_source == "SIMULATED-FALLBACK":
+            return self._idle_result(
+                "feed_unavailable",
+                "Market data feeds are unreachable (Hyperliquid and Bybit). No bar is processed and nothing trades "
+                "until a real feed returns.",
+            )
+
+        last_open_ms = self._history_bars[-1].ts_open_ns // 1_000_000 if self._history_bars else 0
+        try:
+            new_bars = self._feed.next_closed_bars(last_open_ms, snap)
+        except Exception as exc:
+            logger.warning("Bar feed poll failed: %s", exc)
+            new_bars = None
+        if new_bars is None or "BTC" not in new_bars:
+            next_close_hint = ""
+            if self._history_bars:
+                next_close_ms = (self._history_bars[-1].ts_close_ns + STEP_15M_NS) // 1_000_000
+                remaining_s = max(0.0, next_close_ms / 1000.0 - datetime.now(timezone.utc).timestamp())
+                next_close_hint = f" Next 15m candle closes in {remaining_s / 60.0:.1f} min."
+            return self._idle_result(
+                "waiting_for_bar",
+                f"No new closed 15m candle since the last bar; positions are held and nothing is counted.{next_close_hint}",
+            )
+        return self._process_bar(new_bars, snap)
+
+    def _idle_result(self, action: str, message: str) -> ControlActionResult:
+        now = datetime.now(timezone.utc).timestamp()
+        if now - self._last_waiting_log_ts >= WAITING_LOG_INTERVAL_SEC:
+            self._last_waiting_log_ts = now
+            line = f"[{self._now_str()} • {action.upper()}] {message}"
+            self._activity_log.append(line)
+            _append_log_line(line)
+        latest_px = self._history_bars[-1].close if self._history_bars else self._state.dollar_bars[-1].close
+        return ControlActionResult(
+            status="ok",
+            action=action,
+            regime_mode=self._state.regime_mode,
+            is_dry_run=self._state.is_dry_run,
+            plain_english_explanation=message,
+            weights=dict(self._state.portfolio_allocation.weights),
+            gross_leverage=self._state.portfolio_allocation.gross_leverage,
+            tick_count=self._tick_counter,
+            latest_price=latest_px,
+            starting_capital_usd=self._starting_capital_usd,
+            current_equity_usd=self._state.pnl_metrics.current_equity_usd,
+            net_pnl_usd=self._state.pnl_metrics.net_pnl_usd,
+            net_pnl_bps=self._state.pnl_metrics.net_pnl_bps,
+            activity_log=self.activity_log,
+            forensic_record=self._latest_forensic,
+            ledger_summary=self.ledger_summary,
+            bar_processed=False,
+        )
+
+    def _process_bar(self, bars_by_coin: Mapping[str, DollarBar], snap: MultiAssetMarketSnapshot) -> ControlActionResult:
         s = self._state
+        new_bar = bars_by_coin["BTC"]
+        feed_source = str(snap.feed_source)
+        bar_source = self._bar_source_tag(snap)
+
+        # 1. Real bar bookkeeping: history, Parquet store, volatility, hourly returns, HRP, retrain schedule.
+        prev_close = self._history_bars[-1].close if self._history_bars else new_bar.open
+        self._history_bars.append(new_bar)
+        if len(self._history_bars) > FEATURE_WINDOW_BARS * 2:
+            self._history_bars = self._history_bars[-FEATURE_WINDOW_BARS * 2 :]
         self._tick_counter += 1
         k = self._tick_counter
+        bar_index = len(self._history_bars) - 1
+        ts_close = new_bar.ts_close_ns
+        self._parquet_row_count = _persist_bars_to_parquet([new_bar], self._parquet_path, bar_source=bar_source)
 
-        prev_bar = s.dollar_bars[-1]
-        open_px = prev_bar.close
-
-        # Fetch real-time simultaneous multi-asset market data from Hyperliquid L1 (with Bybit failover)
-        multi_snap = get_live_multi_asset_snapshot(coins=("BTC", "ETH", "SOL"), include_l2=True)
-        self._latest_market_snapshot = multi_snap
-
-        btc_snap = multi_snap.get_asset("BTC")
-        eth_snap = multi_snap.get_asset("ETH")
-        sol_snap = multi_snap.get_asset("SOL")
-
-        feed_source: str = multi_snap.feed_source
-        if btc_snap is not None:
-            close_px = round(btc_snap.mid_price, 2)
-            mark_px = round(btc_snap.mark_price, 2)
-            spot_px = round(btc_snap.oracle_price, 2)
-            new_oi = round(btc_snap.open_interest, 2)
-            funding_8h = round(btc_snap.funding_rate_8h_equiv, 6)
-            funding_1h = round(btc_snap.funding_rate_1h, 8)
-        else:
-            close_px, mark_px, spot_px, new_oi, funding_8h, src = _try_fetch_live_bybit_perp_snapshot(
-                prev_bar, self._rng
-            )
-            feed_source = src
-            funding_1h = round(funding_8h / 8.0, 8)
-
-        high_px = round(max(open_px, close_px) * (1.0 + abs(float(self._rng.normal(0.0, 0.0012)))), 2)
-        low_px = round(min(open_px, close_px) * (1.0 - abs(float(self._rng.normal(0.0, 0.0012)))), 2)
-        step_ns = 900_000_000_000
-        ts_open = prev_bar.ts_close_ns
-        ts_close = ts_open + step_ns
-
-        vol = round(float(self._rng.uniform(220.0, 540.0)), 2)
-        actual_btc_ret = (close_px - open_px) / max(open_px, 1.0)
-        buy_frac = float(np.clip(0.50 + actual_btc_ret * 45.0 + self._rng.normal(0.0, 0.08), 0.20, 0.80))
-        dvol = round(close_px * vol, 2)
-
-        new_bar = DollarBar(
-            instrument_id=s.active_instrument,
-            horizon_label="15m",
-            ts_open_ns=ts_open,
-            ts_close_ns=ts_close,
-            open=open_px,
-            high=high_px,
-            low=low_px,
-            close=close_px,
-            volume=vol,
-            dollar_volume=dvol,
-            buy_dollar_volume=round(dvol * buy_frac, 2),
-            sell_dollar_volume=round(dvol * (1.0 - buy_frac), 2),
-            open_interest=new_oi,
-            funding_rate_8h=funding_8h,
-            funding_rate_1h=funding_1h,
-            mark_price=mark_px,
-            spot_price=spot_px,
-            liquidation_volume_usd=round(float(self._rng.exponential(180_000.0)), 2),
-            tick_count=4100,
-        )
-
-        # Persist every collected bar to data/btcusdt_perp_bars.parquet for continuous model training!
-        self._history_bars.append(new_bar)
-        self._parquet_row_count = _persist_bars_to_parquet([new_bar])
-        if k % 20 == 0 and len(self._history_bars) >= 60:
-            self._ml_worker = self._fit_worker_on_bars(self._history_bars[-200:])
-            retrain_msg = (
-                f"[{self._now_str()} • M1 MAX RETRAIN] Refitted SVD + Mahalanobis Gate + LightGBM on "
-                f"{self._parquet_row_count} stored Parquet bars ({PARQUET_BARS_FILE.name})."
-            )
-            self._activity_log.append(retrain_msg)
-            _append_log_line(retrain_msg)
-
-        # 1. Calculate REAL Mark-to-Market PnL from the PREVIOUS bar's held positions!
-        prev_weights = s.portfolio_allocation.weights
-        starting_cap = self._starting_capital_usd
-
-        # Real multi-asset returns from live market streaming
-        prev_eth_px = self._prev_asset_prices.get("ETH", 2244.0)
-        prev_sol_px = self._prev_asset_prices.get("SOL", 96.65)
-        curr_eth_px = eth_snap.mid_price if eth_snap else prev_eth_px
-        curr_sol_px = sol_snap.mid_price if sol_snap else prev_sol_px
-
-        actual_eth_ret = (curr_eth_px - prev_eth_px) / max(prev_eth_px, 1.0)
-        actual_sol_ret = (curr_sol_px - prev_sol_px) / max(prev_sol_px, 1.0)
-
-        # Micro-dispersion fallback if polled in rapid succession without quote movement
-        if abs(actual_eth_ret) < 1e-6:
-            actual_eth_ret = actual_btc_ret + float(self._rng.normal(0.0, 0.0004))
-        if abs(actual_sol_ret) < 1e-6:
-            actual_sol_ret = actual_btc_ret + float(self._rng.normal(0.0, 0.0006))
-
-        self._prev_asset_prices["BTC"] = close_px
-        self._prev_asset_prices["ETH"] = curr_eth_px
-        self._prev_asset_prices["SOL"] = curr_sol_px
-
-        asset_rets = {
-            "BTCUSDT-PERP": actual_btc_ret,
-            "ETHUSDT-PERP": actual_eth_ret,
-            "SOLUSDT-PERP": actual_sol_ret,
-            "BTC": actual_btc_ret,
-            "ETH": actual_eth_ret,
-            "SOL": actual_sol_ret,
+        sigma_bar = self._sigma_estimator.update(math.log(max(new_bar.close, 1e-12) / max(prev_close, 1e-12)))
+        hourly_prices = {
+            coin: (bars_by_coin[coin].close if coin in bars_by_coin else (a.mid_price if (a := snap.get_asset(coin)) is not None else 0.0))
+            for coin in ASSETS
         }
-
-        if s.regime_mode == ExecutionRegimeMode.EMERGENCY_FLATTENED:
-            directional_pnl_usd = 0.0
-            carry_pnl_usd = 0.0
-            fee_cost_usd = 0.0
-        elif s.regime_mode == ExecutionRegimeMode.CARRY_ONLY_FALLBACK:
-            directional_pnl_usd = 0.0
-            # 15m fraction of 8h funding carry (1/32 of 8h epoch on 25% carry notional)
-            carry_pnl_usd = round(starting_cap * 0.25 * (abs(funding_8h) / 32.0), 2)
-            fee_cost_usd = 0.0
-        else:
-            directional_pnl_usd = sum(
-                prev_weights.get(coin, 0.0) * starting_cap * ret_val
-                for coin, ret_val in asset_rets.items()
-            )
-            carry_pnl_usd = round(starting_cap * 0.15 * (abs(funding_8h) / 32.0), 2)
-            # Hyperliquid fee schedule: 1.5 bps maker fee on fractional portfolio turnover
-            avg_turnover = 0.08
-            fee_cost_usd = round(starting_cap * avg_turnover * 0.00015, 2)
-
-        pnl_delta_usd = round(directional_pnl_usd + carry_pnl_usd - fee_cost_usd, 2)
-        if pnl_delta_usd > 0:
-            self._wins += 1
-        elif pnl_delta_usd < 0:
-            self._losses += 1
-
-        self._total_realized_pnl = round(self._total_realized_pnl + pnl_delta_usd, 2)
-        new_net_pnl_usd = self._total_realized_pnl
-        new_net_pnl_bps = round((new_net_pnl_usd / starting_cap) * 10_000.0, 1)
-
-        self._total_fees_paid_usd = round(self._total_fees_paid_usd + fee_cost_usd, 2)
-        new_total_fees = self._total_fees_paid_usd
-        # Hyperliquid fee advantage: Taker 4.5 bps vs 1.5 bps Maker = 3.0 bps saved on turnover
-        saved_this_bar = round(fee_cost_usd * (3.0 / 1.5), 2)
-        self._total_fee_savings_usd = round(self._total_fee_savings_usd + saved_this_bar, 2)
-        new_fee_savings = self._total_fee_savings_usd
-
-        updated_pnl = PnLAndExecutionMetrics(
-            starting_capital_usd=starting_cap,
-            net_pnl_usd=new_net_pnl_usd,
-            net_pnl_bps=new_net_pnl_bps,
-            gross_pnl_usd=round(new_net_pnl_usd + new_total_fees, 2),
-            total_fees_paid_usd=new_total_fees,
-            maker_fill_ratio=s.pnl_metrics.maker_fill_ratio,
-            taker_fill_ratio=s.pnl_metrics.taker_fill_ratio,
-            fee_savings_usd=new_fee_savings,
-            fee_savings_bps=s.pnl_metrics.fee_savings_bps,
-            annualized_carry_apr_pct=round(abs(funding_1h) * 24.0 * 365.0 * 100.0, 1),
-            is_dry_run=s.is_dry_run,
+        self._hourly_returns.update(ts_close, hourly_prices)
+        self._latest_hrp_weights = self._hrp_scheduler.compute(ts_close, self._hourly_returns.matrix())
+        feed_avail = self._feed.availability
+        self._data_availability = feed_avail.model_copy(
+            update={
+                "hourly_return_rows": self._hourly_returns.n_rows,
+                "options_surface": self._data_availability.options_surface,
+                "hlp_vault": self._data_availability.hlp_vault,
+            }
         )
+        self._maybe_retrain(ts_close)
 
-        # 2. Run REAL FFD + Positioning + Stage-1 SVD + Mahalanobis Gate + Stage-2 LightGBM + M1 Max Metal GPU!
-        bars_window = (s.dollar_bars + [new_bar])[-16:]
-        snaps_window = compute_positioning_snapshots(bars_window, close_ffd_config=self._ffd_close_cfg)
-        new_pos_sig = snaps_window[-1]
+        # 2. Real features: FFD -> Positioning -> SVD -> Mahalanobis Gate -> Calibrated LightGBM.
+        feature_bars = self._history_bars[-FEATURE_WINDOW_BARS:]
+        snaps_window = compute_positioning_snapshots(feature_bars, close_ffd_config=self._ffd_close_cfg)
+        new_pos_sig: PositioningSignalSnapshot = snaps_window[-1]
         x_cont_win, bin_win, _ = extract_continuous_and_binary_from_snapshots(snaps_window)
-        _gpu_energy = _run_m1max_metal_gpu_regime_pass(x_cont_win[-1])
+        features_ok = bool(np.all(np.isfinite(x_cont_win[-1]))) and len(feature_bars) >= 16
+        if features_ok:
+            _run_m1max_metal_gpu_regime_pass(x_cont_win[-1])
 
-        vpin_val = round(float(self._vpin_monitor.update(price=close_px, volume=vol, ts_ns=ts_close)), 3)
+        vpin_val = round(float(self._vpin_monitor.update(price=new_bar.close, volume=new_bar.volume, ts_ns=ts_close)), 3)
         hawkes_snap = self._hawkes_monitor.update(ts_ns=ts_close, vpin=vpin_val)
         new_hawkes = HawkesStateSnapshot(
             ts_ns=ts_close,
@@ -1051,158 +1545,196 @@ class ControlCenterStateStore:
             mu=hawkes_snap.mu,
             alpha=hawkes_snap.alpha,
             beta=hawkes_snap.beta,
-            branching_ratio_eta=round(min(0.66, max(0.22, hawkes_snap.branching_ratio_eta)), 3),
-            vpin=round(min(0.58, max(0.18, vpin_val)), 3),
-            toxic_sweep_active=False,
+            branching_ratio_eta=round(min(1.0, max(0.0, hawkes_snap.branching_ratio_eta)), 3),
+            vpin=round(min(1.0, max(0.0, vpin_val)), 3),
+            toxic_sweep_active=bool(vpin_val > 0.60 or hawkes_snap.branching_ratio_eta > 0.70),
         )
 
-        new_meta = self._ml_worker.predict_single(
-            instrument_id=s.active_instrument,
-            ts_close_ns=ts_close,
-            x_continuous_row=x_cont_win[-1],
-            liquidation_exhaustion_flag=int(bin_win[-1]),
-            primary_direction=new_pos_sig.primary_direction if new_pos_sig.primary_direction != 0 else 1,
-            sigma_bar=0.0045,
-            vpin=new_hawkes.vpin,
-        )
+        if self._ml_worker is not None and features_ok:
+            new_meta = self._ml_worker.predict_single(
+                instrument_id=s.active_instrument,
+                ts_close_ns=ts_close,
+                x_continuous_row=x_cont_win[-1],
+                liquidation_exhaustion_flag=int(bin_win[-1]),
+                primary_direction=new_pos_sig.primary_direction,
+                sigma_bar=sigma_bar,
+                vpin=new_hawkes.vpin,
+            )
+        else:
+            new_meta = _neutral_meta_prediction(s.active_instrument, ts_close, self._last_retrain_message)
 
-        tb_cfg = TripleBarrierConfig()
-        barrier_frac = tb_cfg.effective_profit_barrier_decimal(0.0045)
-        new_barrier = TripleBarrierLabel(
-            bar_index=k - 1,
-            primary_direction=new_meta.primary_direction,
-            gross_return=round(actual_btc_ret, 5),
-            net_return=round(actual_btc_ret - 0.0004, 5),
-            fee_cost=0.0004,
-            funding_cost=0.0001,
-            upper_barrier=round(close_px * (1.0 + barrier_frac), 2),
-            lower_barrier=round(close_px * (1.0 - 0.00675), 2),
-            hit_bar_offset=6,
-            barrier_touched="PROFIT" if pnl_delta_usd >= 0 else "STOP",
-            meta_label=1 if pnl_delta_usd >= 0 else 0,
-        )
-
-        pos_window = (s.positioning_signals + [new_pos_sig])[-16:]
-        barriers_window = (s.barrier_labels + [new_barrier])[-16:]
-        meta_window = (s.meta_predictions + [new_meta])[-16:]
-        hawkes_window = (s.hawkes_history + [new_hawkes])[-16:]
-
-        # 3. Evaluate 3-Model Apple Silicon (MLX) Risk Committee & Consensus Multiplier
+        # 3. Risk committee from live prices and per-asset funding.
+        prices = {coin: (a.mid_price if (a := snap.get_asset(coin)) is not None else hourly_prices[coin]) for coin in ASSETS}
+        fundings = {coin: (a.funding_rate_1h if (a := snap.get_asset(coin)) is not None else 0.0) for coin in ASSETS}
+        if "BTC" in bars_by_coin:
+            prices["BTC"] = new_bar.close
+            fundings["BTC"] = new_bar.funding_rate_1h
         macro_eval = self._risk_sentinel.evaluate(stablecoin_depeg_bps=1.5, dvol_index=51.0)
         breadth_eval = self._risk_breadth.evaluate(
-            MultiAssetTelemetry(
-                asset_prices={"BTC": close_px, "ETH": curr_eth_px, "SOL": curr_sol_px},
-                funding_rates_1h={"BTC": funding_1h, "ETH": actual_eth_ret * 0.0001, "SOL": actual_sol_ret * 0.0001},
-            )
+            MultiAssetTelemetry(asset_prices=prices, funding_rates_1h=fundings)
         )
         critic_eval = self._risk_critic.evaluate(
             PortfolioStressInput(
-                gross_leverage=s.portfolio_allocation.gross_leverage,
+                gross_leverage=min(2.5, self._positions.gross_exposure_usd() / max(1.0, self._starting_capital_usd + self._total_realized_pnl)),
                 vpin=new_hawkes.vpin,
                 hawkes_eta=new_hawkes.branching_ratio_eta,
             )
         )
         committee_eval = self._risk_consensus.reconcile(macro_eval, breadth_eval, critic_eval)
         self._latest_committee_output = committee_eval
-
         m_regime = committee_eval.regime_multiplier
-        if s.regime_mode in (ExecutionRegimeMode.PAUSED_ENTRIES, ExecutionRegimeMode.EMERGENCY_FLATTENED):
-            eff_m = 0.0 if s.regime_mode == ExecutionRegimeMode.EMERGENCY_FLATTENED else 0.5 * m_regime
-        elif s.regime_mode == ExecutionRegimeMode.CARRY_ONLY_FALLBACK:
-            eff_m = 0.25
+        regime_veto = (
+            committee_eval.tail_risk_flag
+            or m_regime <= 0.0
+            or s.regime_mode == ExecutionRegimeMode.EMERGENCY_FLATTENED
+        )
+
+        # 4. Sleeves (P0.1) and the governing allocation equation (P0.2, P0.3).
+        self._evaluate_sleeves(snap, bars_by_coin, committee_eval, ts_close)
+        targets, portfolio_alloc, kelly_map = self._build_targets(new_meta, sigma_bar, m_regime, s.regime_mode)
+        self._latest_targets = targets
+
+        # 5. Position lifecycle (P0.5) with signed funding and real fees (P0.6).
+        marks = self._build_marks(bars_by_coin, snap)
+        closed = self._positions.process_bar(
+            bar_index=bar_index, ts_ns=ts_close, marks=marks, targets=targets, regime_veto=regime_veto
+        )
+        opened: list[Position] = []
+        entries_allowed = (
+            not regime_veto
+            and s.regime_mode in (ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY, ExecutionRegimeMode.CARRY_ONLY_FALLBACK)
+        )
+        cash_equity = self._starting_capital_usd + self._total_realized_pnl
+        if entries_allowed:
+            for target in targets.values():
+                if target.weight == 0.0:
+                    continue
+                m = marks.get(target.asset)
+                if m is None or m.bar is None:
+                    continue
+                pos = self._positions.open_position(
+                    target,
+                    equity_usd=cash_equity,
+                    price=m.bar.close,
+                    spot_price=m.spot_price,
+                    bar_index=bar_index,
+                    ts_ns=ts_close,
+                    sigma_bar=sigma_bar,
+                )
+                if pos is not None:
+                    opened.append(pos)
+                    self._maker_fills += 2 if pos.hedged else 1
+
+        # 6. Ledger: realise only what closed on this bar.
+        bar_net_pnl = 0.0
+        bar_fees = 0.0
+        for rec in closed:
+            bar_net_pnl += rec.net_pnl_usd
+            bar_fees += rec.fee_usd
+            self._total_funding_pnl_usd += rec.funding_pnl_usd
+            if rec.is_win:
+                self._wins += 1
+            else:
+                self._losses += 1
+            if rec.exit_reason in (PositionExitReason.STOP_BARRIER, PositionExitReason.REGIME_VETO):
+                self._taker_fills += 2 if rec.hedged else 1
+            else:
+                self._maker_fills += 2 if rec.hedged else 1
+            rec_dict = rec.model_dump(mode="json")
+            rec_dict["realized_pnl_usd"] = round(rec.net_pnl_usd, 4)
+            rec_dict["why_did_it_trade"] = f"{rec.entry_reason} | exit: {rec.exit_reason.value}"
+            self._trade_history.append(rec_dict)
+        self._total_realized_pnl = round(self._total_realized_pnl + bar_net_pnl, 4)
+        self._total_fees_paid_usd = round(self._total_fees_paid_usd + bar_fees, 4)
+        starting_cap = self._starting_capital_usd
+        new_net_pnl_usd = round(self._total_realized_pnl, 2)
+        new_net_pnl_bps = round((new_net_pnl_usd / max(1.0, starting_cap)) * 10_000.0, 1)
+        unrealized = self._positions.total_unrealized_pnl_usd(marks)
+
+        btc_carry = self._latest_carry_evaluations.get("BTC")
+        updated_pnl = PnLAndExecutionMetrics(
+            starting_capital_usd=starting_cap,
+            net_pnl_usd=new_net_pnl_usd,
+            net_pnl_bps=new_net_pnl_bps,
+            gross_pnl_usd=round(new_net_pnl_usd + self._total_fees_paid_usd, 2),
+            total_fees_paid_usd=round(self._total_fees_paid_usd, 2),
+            maker_fill_ratio=round(self._maker_fill_ratio(), 4),
+            taker_fill_ratio=round(1.0 - self._maker_fill_ratio(), 4),
+            fee_savings_usd=0.0,
+            fee_savings_bps=0.0,
+            annualized_carry_apr_pct=round(btc_carry.annualized_funding_apr * 100.0, 2) if btc_carry is not None else 0.0,
+            is_dry_run=s.is_dry_run,
+        )
+
+        # 7. Plain-English activity line and decision record.
+        actual_btc_ret = (new_bar.close - new_bar.open) / max(new_bar.open, 1.0)
+        n_open = len(self._positions.open_positions)
+        if closed and opened:
+            action_str = "EXIT_AND_ENTER"
+        elif closed:
+            action_str = "EXIT_" + "_".join(sorted({c.exit_reason.value for c in closed}))
+        elif opened:
+            action_str = "ENTER_" + "_".join(sorted({("LONG" if p.side > 0 else "SHORT") if not p.hedged else "CARRY" for p in opened}))
+        elif n_open > 0:
+            action_str = "HOLD_POSITIONS"
         else:
-            eff_m = m_regime
+            action_str = "HOLD_CASH"
 
-        p_eff = max(0.58, new_meta.p_meta)
-        btc_dir: Literal[-1, 0, 1] = (
-            0
-            if s.regime_mode != ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY
-            else (new_meta.effective_direction if new_meta.effective_direction != 0 else 1)
+        outcome_tag = (
+            f"closed {len(closed)}: ${bar_net_pnl:+.2f} net" if closed else ("no closes" if n_open or opened else "flat")
         )
-        f_kelly = compute_fractional_kelly(p_eff, gamma_frac=0.5)
-
-        alloc_inputs = [
-            AssetAllocationInput(
-                asset_id="BTCUSDT-PERP",
-                y_primary=btc_dir,
-                w_hrp=0.45,
-                p_meta=p_eff,
-                expected_gross_return_bps=96.0,
-                fee_schedule=FeeSchedule.usdt_perp(),
-                epistemic_gate_passed=new_meta.epistemic_gate_passed,
-            ),
-            AssetAllocationInput(
-                asset_id="ETHUSDT-PERP",
-                y_primary=1 if s.regime_mode == ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY else 0,
-                w_hrp=0.35,
-                p_meta=round(max(0.55, p_eff - 0.03), 3),
-                expected_gross_return_bps=88.0,
-                fee_schedule=FeeSchedule.usdt_perp(),
-                epistemic_gate_passed=new_meta.epistemic_gate_passed,
-            ),
-            AssetAllocationInput(
-                asset_id="SOLUSDT-PERP",
-                y_primary=-1 if s.regime_mode == ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY else 0,
-                w_hrp=0.20,
-                p_meta=round(max(0.54, p_eff - 0.05), 3),
-                expected_gross_return_bps=108.0,
-                fee_schedule=FeeSchedule.usdt_perp(),
-                epistemic_gate_passed=new_meta.epistemic_gate_passed,
-            ),
-        ]
-        portfolio_alloc = compute_signed_target_weights(
-            inputs=alloc_inputs,
-            regime_multiplier=eff_m,
-            gamma_frac=0.5,
-            max_gross_leverage=2.5,
-        )
-
-        side_str: Literal["BUY", "SELL", "FLAT", "NONE"] = (
-            "BUY" if btc_dir > 0 else ("SELL" if btc_dir < 0 else "FLAT")
-        )
-        outcome_tag = "🟢 WIN" if pnl_delta_usd > 0 else ("🔴 LOSS" if pnl_delta_usd < 0 else "⚪ FLAT")
         summary_msg = (
-            f"[{self._now_str()} • Bar #{k} • {feed_source}] BTC ${open_px:,.2f} -> ${close_px:,.2f} ({actual_btc_ret:+.2%}) | "
-            f"{outcome_tag}: ${pnl_delta_usd:+.2f} (Fee: -${fee_cost_usd:.2f}) | "
-            f"LightGBM p_meta={new_meta.p_meta:.1%}, DI={new_meta.mahalanobis_di:.2f} | "
-            f"Equity=${updated_pnl.current_equity_usd:,.2f} (W:{self._wins}/L:{self._losses})"
+            f"[{self._now_str()} • Bar #{k} • {feed_source}] BTC ${new_bar.open:,.2f} -> ${new_bar.close:,.2f} ({actual_btc_ret:+.2%}, "
+            f"H ${new_bar.high:,.2f} L ${new_bar.low:,.2f}) | {action_str} ({outcome_tag}, opened {len(opened)}, open {n_open}) | "
+            f"p_meta={new_meta.p_meta:.1%} dir={new_meta.effective_direction:+d} sigma={sigma_bar:.4f} | "
+            f"Equity=${updated_pnl.current_equity_usd:,.2f} (W:{self._wins}/L:{self._losses}, unrealised ${unrealized:+.2f})"
         )
         self._activity_log.append(summary_msg)
         _append_log_line(summary_msg)
 
-        # 4. Synthesize Trade Forensics ("Why Did It Trade?") & Feature Attribution Record
-        trade_id = f"tr_{k}_{int(ts_close / 1_000_000)}"
-        direction_label = "LONG" if btc_dir > 0 else ("SHORT" if btc_dir < 0 else "FLAT")
-        action_str = f"ENTER_{direction_label}" if side_str != "FLAT" else "HOLD_CASH"
-
-        why_text = (
-            f"Long BTC entered: {new_meta.p_meta:.0%} meta-conviction trend signal with "
-            f"{new_meta.mahalanobis_di:.2f} Mahalanobis distance within epistemic bound, "
-            f"low VPIN toxicity ({new_hawkes.vpin:.2f}), and {committee_eval.consensus_risk_score:.0f} ASRI benign macro regime."
-            if btc_dir > 0
-            else (
-                f"{direction_label} {s.active_instrument.split('-')[0]} position: "
-                f"{new_meta.p_meta:.1%} meta-conviction in {new_pos_sig.regime.value} regime; "
-                f"DI={new_meta.mahalanobis_di:.2f} <= {new_meta.di_threshold:.2f} within epistemic bound; "
-                f"microstructure calm (VPIN {new_hawkes.vpin:.2f} <= 0.60, Hawkes eta {new_hawkes.branching_ratio_eta:.2f} <= 0.70); "
-                f"3-model MLX risk consensus {committee_eval.consensus_risk_score:.1f}/100 with M_regime={committee_eval.regime_multiplier:.2f}; "
-                f"sized via Half-Kelly ({f_kelly:.1%}) at {portfolio_alloc.gross_leverage:.2f}x gross leverage."
-            )
+        first_entry = opened[0] if opened else None
+        side_str: Literal["BUY", "SELL", "FLAT", "NONE"] = (
+            ("BUY" if first_entry.side > 0 else "SELL") if first_entry is not None else ("FLAT" if n_open == 0 else "NONE")
         )
+        f_kelly = kelly_map.get("BTC", 0.0)
+        why_parts: list[str] = []
+        for p in opened:
+            why_parts.append(
+                f"Opened {p.sleeve_id} {'carry' if p.hedged else ('long' if p.side > 0 else 'short')} {p.asset} "
+                f"${p.notional_usd:,.2f} at ${p.entry_price:,.2f}: {p.entry_reason}"
+            )
+        for c in closed:
+            why_parts.append(
+                f"Closed {c.sleeve_id} {c.asset} on {c.exit_reason.value} at ${c.exit_price:,.2f}: "
+                f"gross ${c.gross_pnl_usd:+.2f}, funding ${c.funding_pnl_usd:+.2f}, fees ${c.fee_usd:.2f}, net ${c.net_pnl_usd:+.2f}"
+            )
+        if not why_parts:
+            why_parts.append(
+                f"No entry: BTC meta-labeller p_meta={new_meta.p_meta:.1%} direction={new_meta.effective_direction:+d} "
+                f"({'gate open' if new_meta.epistemic_gate_passed else 'gate closed or no model'}); "
+                f"derivatives directions {[sig.primary_direction for sig in self._latest_derivatives_signals.values()]}; "
+                f"carry actionable {[ev.is_actionable for ev in self._latest_carry_evaluations.values()]}; "
+                f"regime M={m_regime:.2f}{' (veto)' if regime_veto else ''}; {n_open} position(s) held."
+            )
+        why_text = " ".join(why_parts)
 
         feature_attr: dict[str, float] = {
             "ffd_close_zscore": round(float(new_pos_sig.ffd_close_zscore), 4),
             "ffd_oi_zscore": round(float(new_pos_sig.ffd_oi_zscore), 4),
             "oi_funding_basis_zscore": round(float(new_pos_sig.oi_funding_basis_zscore), 4),
             "basis_pct": round(float(new_pos_sig.basis_pct), 6),
-            "funding_rate_1h": round(float(funding_1h), 8),
-            "funding_rate_8h": round(float(funding_8h), 6),
+            "funding_rate_1h": round(float(new_bar.funding_rate_1h), 8),
+            "funding_rate_8h": round(float(new_bar.funding_rate_8h), 6),
             "liquidation_zscore": round(float(new_pos_sig.liquidation_zscore), 4),
             "regime_weight_bps": round(float(new_meta.expected_net_edge_bps), 1),
             "kelly_conviction": round(float(f_kelly), 4),
-            "m_regime_multiplier": round(float(eff_m), 4),
+            "m_regime_multiplier": round(float(m_regime), 4),
+            "sigma_bar_ewma96": round(float(sigma_bar), 6),
         }
+        for coin, w in self._latest_hrp_weights.items():
+            feature_attr[f"hrp_w_{coin}"] = round(float(w), 4)
 
+        trade_id = f"bar_{k}_{int(ts_close / 1_000_000)}"
         forensic_rec = TradeForensicRecord(
             trade_id=trade_id,
             timestamp_ns=ts_close,
@@ -1210,34 +1742,44 @@ class ControlCenterStateStore:
             instrument_id=s.active_instrument.split("-")[0],
             action=action_str,
             side=side_str,
-            fill_price=close_px,
-            quantity=round(starting_cap * 0.45 * f_kelly / max(1.0, close_px), 4),
-            notional_usd=round(starting_cap * 0.45 * f_kelly, 2),
-            realized_pnl_usd=pnl_delta_usd,
-            realized_pnl_bps=round((pnl_delta_usd / starting_cap) * 10_000.0, 1),
-            fee_cost_usd=fee_cost_usd,
-            fee_savings_usd=saved_this_bar,
+            fill_price=first_entry.entry_price if first_entry is not None else new_bar.close,
+            quantity=round(first_entry.size, 6) if first_entry is not None else 0.0,
+            notional_usd=round(first_entry.notional_usd, 2) if first_entry is not None else 0.0,
+            realized_pnl_usd=round(bar_net_pnl, 4),
+            realized_pnl_bps=round((bar_net_pnl / max(1.0, starting_cap)) * 10_000.0, 2),
+            fee_cost_usd=round(bar_fees, 4),
+            fee_savings_usd=0.0,
             regime=new_pos_sig.regime.value,
             p_meta=round(new_meta.p_meta, 4),
             mahalanobis_di=round(new_meta.mahalanobis_di, 4),
             vpin=round(new_hawkes.vpin, 4),
             hawkes_eta=round(new_hawkes.branching_ratio_eta, 4),
             asri_score=round(committee_eval.consensus_risk_score, 1),
-            m_regime=round(committee_eval.regime_multiplier, 3),
+            m_regime=round(m_regime, 3),
             kelly_fraction=round(f_kelly, 4),
             why_did_it_trade=why_text,
             feature_attribution=feature_attr,
+            sleeve_id=first_entry.sleeve_id if first_entry is not None else "",
+            entries=[p.position_id for p in opened],
+            exits=[c.trade_id for c in closed],
+            open_positions=n_open,
+            unrealized_pnl_usd=round(unrealized, 4),
         )
-        forensic_dict = forensic_rec.model_dump()
+        forensic_dict = forensic_rec.model_dump(mode="json")
         self._forensics_history.append(forensic_dict)
         self._latest_forensic = forensic_dict
-        self._trade_history.append(forensic_dict)
-
-        # 5. Persist updated ledger state atomically to data/account_ledger.json
         self._persist_ledger_state_atomic()
 
-        order_cmd_side: Literal["BUY", "SELL", "NONE"] = (
-            "BUY" if btc_dir > 0 else ("SELL" if btc_dir < 0 else "NONE")
+        # 8. Dashboard state window.
+        bars_window = self._history_bars[-UI_WINDOW_BARS:]
+        pos_window = snaps_window[-UI_WINDOW_BARS:]
+        new_barrier = self._barrier_label_for_bar(new_bar, bar_index, sigma_bar, closed)
+        barriers_window = (s.barrier_labels + [new_barrier])[-UI_WINDOW_BARS:]
+        meta_window = (s.meta_predictions + [new_meta])[-UI_WINDOW_BARS:]
+        hawkes_window = (s.hawkes_history + [new_hawkes])[-UI_WINDOW_BARS:]
+
+        order_side: Literal["BUY", "SELL", "NONE"] = (
+            ("BUY" if first_entry.side > 0 else "SELL") if first_entry is not None else "NONE"
         )
         self._state = DashboardTelemetryState(
             active_instrument=s.active_instrument,
@@ -1248,12 +1790,12 @@ class ControlCenterStateStore:
             asri_risk=committee_eval.to_systemic_risk_output(),
             hawkes_state=new_hawkes,
             last_order_command=ExecutionOrderCommand(
-                instrument_id=s.active_instrument,
+                instrument_id=f"{first_entry.asset}USDT-PERP" if first_entry is not None else s.active_instrument,
                 ts_ns=ts_close,
-                action=ExecutionAction.PLACE_GTX_MAKER if order_cmd_side != "NONE" else ExecutionAction.HOLD_RESTING_HYSTERESIS,
-                side=order_cmd_side,
-                target_price=round(close_px - 4.5, 2),
-                quantity=0.45 if order_cmd_side != "NONE" else 0.0,
+                action=ExecutionAction.PLACE_GTX_MAKER if order_side != "NONE" else ExecutionAction.HOLD_RESTING_HYSTERESIS,
+                side=order_side,
+                target_price=round(first_entry.entry_price, 2) if first_entry is not None else round(new_bar.close, 2),
+                quantity=round(first_entry.size, 6) if first_entry is not None else 0.0,
                 post_only_gtx=True,
                 time_in_force="GTX",
                 consecutive_rejections=0,
@@ -1281,7 +1823,7 @@ class ControlCenterStateStore:
             weights=dict(self._state.portfolio_allocation.weights),
             gross_leverage=self._state.portfolio_allocation.gross_leverage,
             tick_count=self._tick_counter,
-            latest_price=close_px,
+            latest_price=new_bar.close,
             starting_capital_usd=starting_cap,
             current_equity_usd=updated_pnl.current_equity_usd,
             net_pnl_usd=new_net_pnl_usd,
@@ -1289,40 +1831,67 @@ class ControlCenterStateStore:
             activity_log=self.activity_log,
             forensic_record=forensic_dict,
             ledger_summary=self.ledger_summary,
+            bar_processed=True,
+            closed_trades=[c.model_dump(mode="json") for c in closed],
+            opened_positions=[p.model_dump(mode="json") for p in opened],
         )
+
+    # ------------------------------------------------------------------ control actions
 
     def apply_control_action(self, action: str) -> ControlActionResult:
         """Apply one of the four operational control actions and update ``self._state``."""
         normalized = action.strip().lower()
         ts_label = self._now_str()
+        flattened: list[ClosedTradeRecord] = []
         if normalized == "start_dry_run":
             mode = ExecutionRegimeMode.DIRECTIONAL_PLUS_CARRY
             self._auto_running = True
             msg = (
-                f"[{ts_label}] ▶ DRY-RUN ACTIVE: Running real LightGBM + SVD + VPIN/Hawkes inference "
-                f"on ${self._starting_capital_usd:,.2f} paper account."
+                f"[{ts_label}] ▶ DRY-RUN ACTIVE: polling Hyperliquid 15m candles; real LightGBM + sleeves + "
+                f"position lifecycle on ${self._starting_capital_usd:,.2f} paper account."
             )
             is_dry = True
         elif normalized == "pause_entries":
             mode = ExecutionRegimeMode.PAUSED_ENTRIES
             self._auto_running = False
             msg = (
-                f"[{ts_label}] ⏸ ENTRIES PAUSED: Auto-ticking paused and unfilled entry orders cancelled."
+                f"[{ts_label}] ⏸ ENTRIES PAUSED: no new positions; open positions keep their barrier exits."
             )
             is_dry = self._state.is_dry_run
         elif normalized == "switch_carry_only":
             mode = ExecutionRegimeMode.CARRY_ONLY_FALLBACK
             self._auto_running = True
             msg = (
-                f"[{ts_label}] 🏦 CARRY-ONLY MODE: Directional Long/Short bets disabled; "
-                "collecting hedged 8-hour Funding Carry only."
+                f"[{ts_label}] 🏦 CARRY-ONLY MODE: directional sleeves disabled; "
+                "hedged 1-hour funding carry only."
             )
             is_dry = self._state.is_dry_run
         elif normalized == "emergency_flatten":
             mode = ExecutionRegimeMode.EMERGENCY_FLATTENED
             self._auto_running = False
+            marks = self._current_marks()
+            bar_index = max(0, len(self._history_bars) - 1)
+            ts_ns = self._latest_market_snapshot.timestamp_ns if self._latest_market_snapshot is not None else 0
+            flattened = self._positions.close_all(bar_index=bar_index, ts_ns=ts_ns, marks=marks)
+            flat_pnl = 0.0
+            for rec in flattened:
+                flat_pnl += rec.net_pnl_usd
+                self._total_fees_paid_usd = round(self._total_fees_paid_usd + rec.fee_usd, 4)
+                self._total_funding_pnl_usd += rec.funding_pnl_usd
+                self._taker_fills += 2 if rec.hedged else 1
+                if rec.is_win:
+                    self._wins += 1
+                else:
+                    self._losses += 1
+                rec_dict = rec.model_dump(mode="json")
+                rec_dict["realized_pnl_usd"] = round(rec.net_pnl_usd, 4)
+                rec_dict["why_did_it_trade"] = f"{rec.entry_reason} | exit: EMERGENCY_FLATTEN"
+                self._trade_history.append(rec_dict)
+            self._total_realized_pnl = round(self._total_realized_pnl + flat_pnl, 4)
+            self._persist_ledger_state_atomic()
             msg = (
-                f"[{ts_label}] 🛑 EMERGENCY FLATTEN EXECUTED: All positions closed to 100% Cash."
+                f"[{ts_label}] 🛑 EMERGENCY FLATTEN EXECUTED: {len(flattened)} position(s) closed at mark "
+                f"(taker fees), realised ${flat_pnl:+.2f}; 100% cash."
             )
             is_dry = self._state.is_dry_run
         else:
@@ -1339,18 +1908,28 @@ class ControlCenterStateStore:
             last_control_action=normalized,
             last_control_message=msg,
         )
-        # Preserve current accumulated PnL and custom starting capital across mode switches!
         preserved_pnl = self._state.pnl_metrics.model_copy(
-            update={"starting_capital_usd": self._starting_capital_usd, "is_dry_run": is_dry}
+            update={
+                "starting_capital_usd": self._starting_capital_usd,
+                "is_dry_run": is_dry,
+                "net_pnl_usd": round(self._total_realized_pnl, 2),
+                "net_pnl_bps": round((self._total_realized_pnl / max(1.0, self._starting_capital_usd)) * 10_000.0, 1),
+                "total_fees_paid_usd": round(self._total_fees_paid_usd, 2),
+                "gross_pnl_usd": round(self._total_realized_pnl + self._total_fees_paid_usd, 2),
+            }
         )
         self._state = base.model_copy(
             update={
                 "pnl_metrics": preserved_pnl,
+                "ffd_config": self._ffd_close_cfg,
+                "asri_risk": self._state.asri_risk,
+                "hawkes_state": self._state.hawkes_state,
                 "dollar_bars": self._state.dollar_bars,
                 "positioning_signals": self._state.positioning_signals,
                 "barrier_labels": self._state.barrier_labels,
                 "meta_predictions": self._state.meta_predictions,
                 "hawkes_history": self._state.hawkes_history,
+                "portfolio_allocation": self._state.portfolio_allocation if normalized != "emergency_flatten" else self._zero_allocation(),
             }
         )
         if normalized == "start_dry_run":
@@ -1371,6 +1950,8 @@ class ControlCenterStateStore:
             net_pnl_usd=self._state.pnl_metrics.net_pnl_usd,
             net_pnl_bps=self._state.pnl_metrics.net_pnl_bps,
             activity_log=self.activity_log,
+            ledger_summary=self.ledger_summary,
+            closed_trades=[c.model_dump(mode="json") for c in flattened],
         )
 
 
@@ -1379,16 +1960,19 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
     candlestick_fig = build_candlestick_dollar_bar_figure(s)
     weights_fig = build_portfolio_weights_figure(s.portfolio_allocation)
     payload = s.model_dump(mode="json")
+    ledger = store.ledger_summary
     payload.update(
         {
             "tick_count": store.tick_counter,
             "auto_running": store.auto_running,
             "latest_price": s.dollar_bars[-1].close,
             "starting_capital_usd": s.pnl_metrics.starting_capital_usd,
-            "base_capital_usd": store.ledger_summary["base_capital_usd"],
-            "current_cash_usd": store.ledger_summary["current_cash_usd"],
+            "base_capital_usd": ledger["base_capital_usd"],
+            "current_cash_usd": ledger["current_cash_usd"],
             "current_equity_usd": s.pnl_metrics.current_equity_usd,
-            "total_realized_pnl": store.ledger_summary["total_realized_pnl"],
+            "total_realized_pnl": ledger["total_realized_pnl"],
+            "unrealized_pnl_usd": ledger["unrealized_pnl_usd"],
+            "marked_equity_usd": ledger["marked_equity_usd"],
             "net_pnl_usd": s.pnl_metrics.net_pnl_usd,
             "net_pnl_bps": s.pnl_metrics.net_pnl_bps,
             "maker_fill_ratio": s.pnl_metrics.maker_fill_ratio,
@@ -1403,6 +1987,7 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
             "cpcv_gates_passed": s.champion_cpcv.passed_all_gates,
             "challenger_gates_passed": s.challenger_cpcv.passed_all_gates,
             "signed_hrp_cvar_weights": dict(s.portfolio_allocation.weights),
+            "hrp_unsigned_weights": store.hrp_weights,
             "gross_leverage": s.portfolio_allocation.gross_leverage,
             "multi_asset_snapshot": (
                 store.latest_market_snapshot.model_dump(mode="json")
@@ -1412,14 +1997,18 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
             "activity_log": store.activity_log,
             "candlestick_figure": json.loads(json.dumps(candlestick_fig.to_dict())),
             "weights_figure": json.loads(json.dumps(weights_fig.to_dict())),
-            "account_ledger": store.ledger_summary,
-            "win_count": store.ledger_summary["win_count"],
-            "loss_count": store.ledger_summary["loss_count"],
+            "account_ledger": ledger,
+            "win_count": ledger["win_count"],
+            "loss_count": ledger["loss_count"],
             "trade_history": store._trade_history[-25:],
             "forensics": store.forensics_history[-25:],
             "latest_forensic": store.latest_forensic,
             "risk_committee": store.risk_committee_output.model_dump(mode="json"),
             "sleeve_telemetry": store.sleeve_telemetry,
+            "open_positions": [p.model_dump(mode="json") for p in store.position_manager.open_positions.values()],
+            "sleeve_targets": {k: t.model_dump(mode="json") for k, t in store.latest_targets.items()},
+            "data_availability": store.data_availability.model_dump(mode="json"),
+            "sigma_bar_ewma96": store.sigma_bar,
         }
     )
     return payload
@@ -1433,9 +2022,12 @@ def create_app(store: ControlCenterStateStore | None = None) -> FastAPI:
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         async def _background_ticker() -> None:
             while True:
-                await asyncio.sleep(4.0)
+                await asyncio.sleep(10.0)
                 if state_store.auto_running:
-                    state_store.step_simulation_tick()
+                    try:
+                        await asyncio.to_thread(state_store.step_simulation_tick)
+                    except Exception as exc:
+                        logger.error("Background tick failed: %s", exc)
 
         task = asyncio.create_task(_background_ticker())
         try:
@@ -1445,7 +2037,7 @@ def create_app(store: ControlCenterStateStore | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Gemini Argon 4 — M1 Max Control Center API",
-        version="4.0.0",
+        version="4.1.0",
         description="Interactive Web UI & REST Control Center for the M1 Max Quantitative Derivatives Engine.",
         lifespan=lifespan,
     )
@@ -1463,27 +2055,31 @@ def create_app(store: ControlCenterStateStore | None = None) -> FastAPI:
 
     @app.get("/api/state")
     def get_live_state() -> dict[str, Any]:
-        """Return live telemetry, PnL, Maker/Taker ratio, ASRI summary, CPCV gates, and HRP-CVaR weights."""
+        """Return live telemetry, PnL, positions, sleeve telemetry, CPCV gates, and HRP-CVaR weights."""
         return _serialize_live_state(state_store)
 
     @app.get("/api/forensics")
     def get_forensics() -> dict[str, Any]:
-        """Return trade forensics ("Why Did It Trade?") history and feature attribution."""
+        """Return per-bar decision records ("Why Did It Trade?"), closed trades, and sleeve attribution."""
         return {
             "status": "ok",
             "total_records": len(state_store.forensics_history),
             "records": state_store.forensics_history[-50:],
             "latest": state_store.latest_forensic,
+            "closed_trades": state_store._trade_history[-50:],
             "ledger_summary": state_store.ledger_summary,
             "risk_committee": state_store.risk_committee_output.model_dump(mode="json"),
             "sleeve_telemetry": state_store.sleeve_telemetry,
+            "data_availability": state_store.data_availability.model_dump(mode="json"),
         }
 
     @app.post("/api/tick")
     def post_simulation_tick() -> dict[str, Any]:
-        """Advance the live Dry-Run simulation by 1 bar and return full updated state & figures."""
-        state_store.step_simulation_tick()
-        return _serialize_live_state(state_store)
+        """Poll for a new closed 15m bar, process it if present, and return the full state."""
+        result = state_store.step_simulation_tick()
+        payload = _serialize_live_state(state_store)
+        payload["tick_result"] = result.model_dump(mode="json", exclude={"activity_log", "ledger_summary"})
+        return payload
 
     @app.post("/api/reset")
     def post_reset_account(req: ResetCapitalRequest) -> dict[str, Any]:

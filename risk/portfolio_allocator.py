@@ -12,6 +12,7 @@ Implements:
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Final, Literal, Mapping, Sequence
 
@@ -298,6 +299,217 @@ def compute_hrp_cvar_weight_dict(
         cvar_method=cvar_method,
     )
     return {str(asset_id): float(w_arr[i]) for i, asset_id in enumerate(asset_ids)}
+
+
+# ==============================================================================
+# Rolling hourly return matrix and hourly HRP-CVaR weight schedule (REINFORCEMENT_PLAN P0.3)
+# ==============================================================================
+
+HRP_MIN_RETURN_ROWS: Final[int] = 96
+NANOSECONDS_PER_HOUR: Final[int] = 3_600_000_000_000
+
+_hrp_logger = logging.getLogger("phoenix.hrp")
+
+
+class RollingHourlyReturnMatrix:
+    """Rolling matrix of 1-hour log returns for a fixed asset universe.
+
+    Rows are appended either from a seed of hourly closes (``seed_from_hourly_closes``) or
+    online from live prices (``update``), which appends one row per completed hour bucket.
+    The matrix is strictly causal: a row for hour ``h`` is formed from the close observed at
+    the end of hour ``h`` against the close at the end of hour ``h - 1``.
+    """
+
+    def __init__(self, asset_ids: Sequence[str], max_rows: int = 720) -> None:
+        if not asset_ids:
+            raise ValueError("asset_ids must not be empty")
+        if max_rows < 2:
+            raise ValueError(f"max_rows must be >= 2, got {max_rows}")
+        self._asset_ids: tuple[str, ...] = tuple(str(a) for a in asset_ids)
+        self._max_rows = max_rows
+        self._rows: list[list[float]] = []
+        self._last_hour_bucket: int | None = None
+        self._last_hourly_close: dict[str, float] = {}
+
+    @property
+    def asset_ids(self) -> tuple[str, ...]:
+        """Asset universe in column order."""
+        return self._asset_ids
+
+    @property
+    def n_rows(self) -> int:
+        """Number of hourly return rows currently held."""
+        return len(self._rows)
+
+    @property
+    def last_hour_bucket(self) -> int | None:
+        """Hour bucket (unix hours) of the most recent row, or None."""
+        return self._last_hour_bucket
+
+    def matrix(self) -> NDArray[np.float64]:
+        """Return the (n_rows, n_assets) matrix of hourly log returns."""
+        if not self._rows:
+            return np.empty((0, len(self._asset_ids)), dtype=np.float64)
+        return np.asarray(self._rows, dtype=np.float64)
+
+    def seed_from_hourly_closes(self, hourly_closes: Mapping[str, Sequence[tuple[int, float]]]) -> int:
+        """Seed from ``{asset: [(ts_ms, close), ...]}`` hourly closes aligned on common timestamps."""
+        per_asset: dict[str, dict[int, float]] = {}
+        for asset in self._asset_ids:
+            series = hourly_closes.get(asset)
+            if not series:
+                return self.n_rows
+            per_asset[asset] = {
+                int(ts_ms) // 3_600_000: float(px) for ts_ms, px in series if float(px) > 0.0
+            }
+        common = sorted(set.intersection(*(set(d.keys()) for d in per_asset.values())))
+        if len(common) < 2:
+            return self.n_rows
+        self._rows = []
+        prev = common[0]
+        for bucket in common[1:]:
+            self._rows.append(
+                [math.log(per_asset[a][bucket] / per_asset[a][prev]) for a in self._asset_ids]
+            )
+            prev = bucket
+        self._rows = self._rows[-self._max_rows :]
+        self._last_hour_bucket = common[-1]
+        self._last_hourly_close = {a: per_asset[a][common[-1]] for a in self._asset_ids}
+        return self.n_rows
+
+    def update(self, ts_ns: int, prices: Mapping[str, float]) -> bool:
+        """Observe live prices at ``ts_ns``; append one row when a new hour bucket completes.
+
+        Returns True when a row was appended. Prices for every asset in the universe must be
+        present and positive, otherwise the observation is ignored.
+        """
+        if any(a not in prices or float(prices[a]) <= 0.0 for a in self._asset_ids):
+            return False
+        bucket = int(ts_ns) // NANOSECONDS_PER_HOUR
+        if self._last_hour_bucket is None:
+            self._last_hour_bucket = bucket
+            self._last_hourly_close = {a: float(prices[a]) for a in self._asset_ids}
+            return False
+        if bucket <= self._last_hour_bucket:
+            # Same hour: keep the latest close for this bucket, no new row yet.
+            self._last_hourly_close = {a: float(prices[a]) for a in self._asset_ids}
+            return False
+        # A later hour: the previous bucket's last close is final; the first observation of
+        # the new bucket closes nothing yet, so the row is formed from consecutive hourly closes.
+        prev_close = dict(self._last_hourly_close)
+        self._last_hour_bucket = bucket
+        self._last_hourly_close = {a: float(prices[a]) for a in self._asset_ids}
+        self._rows.append([math.log(self._last_hourly_close[a] / prev_close[a]) for a in self._asset_ids])
+        self._rows = self._rows[-self._max_rows :]
+        return True
+
+
+class HRPWeightScheduler:
+    """Compute unsigned HRP-CVaR weights at most once per hour from a rolling return matrix.
+
+    When fewer than ``min_rows`` hourly rows exist, equal weights are returned and a warning
+    is logged; ``last_result_is_fallback`` reports which branch produced the live weights.
+    """
+
+    def __init__(
+        self,
+        asset_ids: Sequence[str],
+        min_rows: int = HRP_MIN_RETURN_ROWS,
+        recompute_interval_ns: int = NANOSECONDS_PER_HOUR,
+        alpha: float = DEFAULT_CVAR_ALPHA,
+        linkage_method: Literal["single", "ward"] = "single",
+        cvar_method: Literal["historical", "parametric", "hybrid"] = "historical",
+    ) -> None:
+        if not asset_ids:
+            raise ValueError("asset_ids must not be empty")
+        if min_rows < 2:
+            raise ValueError(f"min_rows must be >= 2, got {min_rows}")
+        self._asset_ids: tuple[str, ...] = tuple(str(a) for a in asset_ids)
+        self._min_rows = min_rows
+        self._recompute_interval_ns = max(1, int(recompute_interval_ns))
+        self._alpha = alpha
+        self._linkage_method: Literal["single", "ward"] = linkage_method
+        self._cvar_method: Literal["historical", "parametric", "hybrid"] = cvar_method
+        self._last_compute_ts_ns: int | None = None
+        self._last_weights: dict[str, float] = self.equal_weights()
+        self._last_is_fallback: bool = True
+        self._last_rows_used: int = 0
+
+    @property
+    def asset_ids(self) -> tuple[str, ...]:
+        """Asset universe."""
+        return self._asset_ids
+
+    @property
+    def min_rows(self) -> int:
+        """Minimum hourly rows required before HRP-CVaR is trusted."""
+        return self._min_rows
+
+    @property
+    def last_weights(self) -> dict[str, float]:
+        """Most recently produced weights."""
+        return dict(self._last_weights)
+
+    @property
+    def last_result_is_fallback(self) -> bool:
+        """True when the most recent weights are the equal-weight fallback."""
+        return self._last_is_fallback
+
+    @property
+    def last_rows_used(self) -> int:
+        """Rows in the matrix when the weights were last computed."""
+        return self._last_rows_used
+
+    def equal_weights(self) -> dict[str, float]:
+        """Equal-weight fallback summing to 1."""
+        n = float(len(self._asset_ids))
+        return {a: 1.0 / n for a in self._asset_ids}
+
+    def compute(self, ts_ns: int, returns: NDArray[np.float64], force: bool = False) -> dict[str, float]:
+        """Return HRP-CVaR weights for ``returns`` (n_rows, n_assets), recomputing at most hourly."""
+        ret = np.asarray(returns, dtype=np.float64)
+        if (
+            not force
+            and self._last_compute_ts_ns is not None
+            and int(ts_ns) - self._last_compute_ts_ns < self._recompute_interval_ns
+        ):
+            return dict(self._last_weights)
+
+        self._last_compute_ts_ns = int(ts_ns)
+        n_rows = int(ret.shape[0]) if ret.ndim == 2 else 0
+        self._last_rows_used = n_rows
+        if ret.ndim != 2 or ret.shape[1] != len(self._asset_ids) or n_rows < self._min_rows:
+            _hrp_logger.warning(
+                "HRP-CVaR fallback to equal weights: %d hourly return rows available, %d required.",
+                n_rows,
+                self._min_rows,
+            )
+            self._last_weights = self.equal_weights()
+            self._last_is_fallback = True
+            return dict(self._last_weights)
+
+        try:
+            weights = compute_hrp_cvar_weight_dict(
+                returns=ret,
+                asset_ids=self._asset_ids,
+                alpha=self._alpha,
+                linkage_method=self._linkage_method,
+                cvar_method=self._cvar_method,
+            )
+        except Exception as exc:
+            _hrp_logger.warning("HRP-CVaR computation failed (%s); using equal weights.", exc)
+            self._last_weights = self.equal_weights()
+            self._last_is_fallback = True
+            return dict(self._last_weights)
+
+        total = sum(weights.values())
+        if not math.isfinite(total) or total <= 0.0:
+            self._last_weights = self.equal_weights()
+            self._last_is_fallback = True
+            return dict(self._last_weights)
+        self._last_weights = {a: float(w) / total for a, w in weights.items()}
+        self._last_is_fallback = False
+        return dict(self._last_weights)
 
 
 class SignedHRPCVaRAllocator:

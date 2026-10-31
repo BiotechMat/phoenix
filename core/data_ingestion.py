@@ -12,7 +12,8 @@ import concurrent.futures
 import json
 import logging
 import time
-from typing import Any, Final, Literal
+from collections.abc import Mapping, Sequence
+from typing import Any, Final, Literal, Protocol
 import urllib.error
 import urllib.request
 
@@ -20,6 +21,8 @@ import httpx
 
 from core.contracts import (
     AssetMarketSnapshot,
+    DataAvailability,
+    DollarBar,
     L2Level,
     L2OrderBookSnapshot,
     MultiAssetMarketSnapshot,
@@ -784,3 +787,437 @@ async def get_live_multi_asset_snapshot_async(
     return await get_market_data_engine().get_multi_asset_snapshot(
         coins=coins, include_l2=include_l2
     )
+
+
+# ==============================================================================
+# Hyperliquid candle / funding history and bar feeds (REINFORCEMENT_PLAN P0.3 / P0.4)
+# ==============================================================================
+
+
+CANDLE_INTERVAL_MS: Final[dict[str, int]] = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+}
+HORIZON_FOR_INTERVAL: Final[dict[str, Literal["15m", "1h", "4h"]]] = {
+    "15m": "15m",
+    "1h": "1h",
+    "4h": "4h",
+}
+HYPERLIQUID_MAX_CANDLES: Final[int] = 5000
+
+
+def _hl_info_post(payload: dict[str, Any], url: str = HYPERLIQUID_INFO_URL, timeout_sec: float = 2.5) -> Any:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "ProjectPhoenix/4.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_hyperliquid_candles(
+    coin: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int | None = None,
+    url: str = HYPERLIQUID_INFO_URL,
+    timeout_sec: float = 2.5,
+) -> list[dict[str, Any]]:
+    """Fetch raw Hyperliquid ``candleSnapshot`` rows (``t``, ``T``, ``o``, ``h``, ``l``, ``c``, ``v``, ``n``).
+
+    Returns at most the venue's page limit (5000 candles), oldest first.
+    """
+    if interval not in CANDLE_INTERVAL_MS:
+        raise ValueError(f"Unsupported candle interval '{interval}'")
+    resolved_end = int(end_ms) if end_ms is not None else int(time.time() * 1000)
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": normalize_coin_symbol(coin),
+            "interval": interval,
+            "startTime": int(start_ms),
+            "endTime": resolved_end,
+        },
+    }
+    data = _hl_info_post(payload, url=url, timeout_sec=timeout_sec)
+    if not isinstance(data, list):
+        raise ValueError("Unexpected candleSnapshot payload shape")
+    rows = [row for row in data if isinstance(row, dict) and "t" in row and "c" in row]
+    rows.sort(key=lambda r: int(r["t"]))
+    return rows
+
+
+def fetch_hyperliquid_funding_history(
+    coin: str,
+    start_ms: int,
+    end_ms: int | None = None,
+    url: str = HYPERLIQUID_INFO_URL,
+    timeout_sec: float = 2.5,
+) -> list[tuple[int, float]]:
+    """Fetch hourly Hyperliquid funding settlements as ``(time_ms, funding_rate_1h)`` oldest first."""
+    payload: dict[str, Any] = {
+        "type": "fundingHistory",
+        "coin": normalize_coin_symbol(coin),
+        "startTime": int(start_ms),
+    }
+    if end_ms is not None:
+        payload["endTime"] = int(end_ms)
+    data = _hl_info_post(payload, url=url, timeout_sec=timeout_sec)
+    if not isinstance(data, list):
+        raise ValueError("Unexpected fundingHistory payload shape")
+    out: list[tuple[int, float]] = []
+    for row in data:
+        if isinstance(row, dict) and "time" in row and "fundingRate" in row:
+            out.append((int(row["time"]), float(row["fundingRate"])))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def funding_rate_for_time(
+    funding_history: Sequence[tuple[int, float]],
+    ts_ms: int,
+    default: float = 0.0,
+) -> float:
+    """Most recent funding settlement at or before ``ts_ms`` (strictly causal lookup)."""
+    best = default
+    for t_ms, rate in funding_history:
+        if t_ms <= ts_ms:
+            best = rate
+        else:
+            break
+    return best
+
+
+def candle_to_dollar_bar(
+    candle: Mapping[str, Any],
+    *,
+    instrument_id: str,
+    horizon_label: Literal["15m", "1h", "4h"],
+    open_interest: float,
+    funding_rate_1h: float,
+    mark_price: float | None = None,
+    spot_price: float | None = None,
+) -> DollarBar:
+    """Convert one Hyperliquid candle into a ``DollarBar`` without synthesising unavailable fields.
+
+    Taker buy/sell split is not part of the candle, so dollar volume is split evenly and the
+    feed reports ``taker_flow=False``. Liquidation volume is ``0.0`` and reported unavailable.
+    """
+    t_ms = int(candle["t"])
+    close_ms = int(candle.get("T", t_ms + CANDLE_INTERVAL_MS["15m"] - 1)) + 1
+    o_px = float(candle["o"])
+    h_px = float(candle["h"])
+    l_px = float(candle["l"])
+    c_px = float(candle["c"])
+    vol = max(0.0, float(candle.get("v", 0.0)))
+    n_trades = max(1, int(candle.get("n", 1)))
+    dvol = vol * c_px
+    return DollarBar(
+        instrument_id=instrument_id,
+        horizon_label=horizon_label,
+        ts_open_ns=t_ms * 1_000_000,
+        ts_close_ns=close_ms * 1_000_000,
+        open=o_px,
+        high=max(h_px, o_px, c_px),
+        low=min(l_px, o_px, c_px),
+        close=c_px,
+        volume=vol,
+        dollar_volume=dvol,
+        buy_dollar_volume=dvol * 0.5,
+        sell_dollar_volume=dvol * 0.5,
+        open_interest=max(0.0, float(open_interest)),
+        funding_rate_1h=float(funding_rate_1h),
+        funding_rate_8h=float(funding_rate_1h) * 8.0,
+        mark_price=float(mark_price) if mark_price is not None and mark_price > 0.0 else c_px,
+        spot_price=float(spot_price) if spot_price is not None and spot_price > 0.0 else c_px,
+        liquidation_volume_usd=0.0,
+        tick_count=n_trades,
+    )
+
+
+def perp_instrument_id(coin: str) -> str:
+    """Instrument id used for persisted bars (legacy ``BTCUSDT-PERP`` naming kept for the Parquet schema)."""
+    return f"{normalize_coin_symbol(coin)}USDT-PERP"
+
+
+class BarFeed(Protocol):
+    """Source of closed bars and market snapshots for the paper-trading loop.
+
+    The live implementation reads Hyperliquid candles; replay and tests supply scripted bars
+    through the same interface so the tick code path is identical.
+    """
+
+    def snapshot(self) -> MultiAssetMarketSnapshot:
+        """Current multi-asset market snapshot."""
+        ...
+
+    def seed_bars(self, coin: str, n_bars: int, interval: str = "15m") -> tuple[list[DollarBar], DataAvailability]:
+        """Historical closed bars for ``coin`` (oldest first) and what was really available."""
+        ...
+
+    def hourly_closes(self, coin: str, n_hours: int) -> list[tuple[int, float]]:
+        """Hourly ``(ts_ms, close)`` history for HRP return matrices."""
+        ...
+
+    def next_closed_bars(
+        self, after_ts_open_ms: int, snapshot: MultiAssetMarketSnapshot
+    ) -> dict[str, DollarBar] | None:
+        """Bars for the next closed 15m candle after ``after_ts_open_ms``, keyed by coin, or None."""
+        ...
+
+    @property
+    def availability(self) -> DataAvailability:
+        """Availability flags of the most recent poll."""
+        ...
+
+
+class HyperliquidCandleBarFeed:
+    """Live bar feed backed by Hyperliquid ``candleSnapshot`` and ``fundingHistory``."""
+
+    def __init__(
+        self,
+        coins: tuple[str, ...] = DEFAULT_ASSETS,
+        engine: LiveMarketDataEngine | None = None,
+        url: str = HYPERLIQUID_INFO_URL,
+        timeout_sec: float = 2.5,
+        close_grace_ms: int = 2_000,
+    ) -> None:
+        self._coins: tuple[str, ...] = tuple(normalize_coin_symbol(c) for c in coins)
+        self._engine = engine or get_market_data_engine()
+        self._url = url
+        self._timeout = timeout_sec
+        self._close_grace_ms = close_grace_ms
+        self._availability = DataAvailability(feed_source="HYPERLIQUID-L1")
+
+    @property
+    def coins(self) -> tuple[str, ...]:
+        """Coins polled on every bar."""
+        return self._coins
+
+    @property
+    def availability(self) -> DataAvailability:
+        """Availability flags of the most recent poll."""
+        return self._availability
+
+    def snapshot(self) -> MultiAssetMarketSnapshot:
+        """Current live snapshot (Hyperliquid, Bybit failover, simulated fallback flagged by source)."""
+        return self._engine.get_multi_asset_snapshot_sync(coins=self._coins, include_l2=True)
+
+    def seed_bars(self, coin: str, n_bars: int, interval: str = "15m") -> tuple[list[DollarBar], DataAvailability]:
+        """Fetch up to ``n_bars`` closed candles with real hourly funding; OI history is not available."""
+        norm = normalize_coin_symbol(coin)
+        step_ms = CANDLE_INTERVAL_MS[interval]
+        now_ms = int(time.time() * 1000)
+        n_req = max(1, min(int(n_bars), HYPERLIQUID_MAX_CANDLES))
+        start_ms = now_ms - (n_req + 2) * step_ms
+        candles = fetch_hyperliquid_candles(norm, interval, start_ms, now_ms, url=self._url, timeout_sec=self._timeout)
+        closed = [c for c in candles if int(c.get("T", 0)) + 1 <= now_ms - self._close_grace_ms]
+        closed = closed[-n_req:]
+        if not closed:
+            avail = DataAvailability(feed_source="HYPERLIQUID-L1")
+            self._availability = avail
+            return [], avail
+
+        funding_hist: list[tuple[int, float]] = []
+        funding_ok = False
+        try:
+            funding_hist = fetch_hyperliquid_funding_history(
+                norm, int(closed[0]["t"]) - 3_600_000, now_ms, url=self._url, timeout_sec=self._timeout
+            )
+            funding_ok = len(funding_hist) > 0
+        except Exception as exc:
+            logger.warning("Hyperliquid fundingHistory unavailable for %s (%s); funding zero-filled.", norm, exc)
+
+        current_oi = 0.0
+        try:
+            snap = self._engine.latest_cached_snapshot or self.snapshot()
+            asset = snap.get_asset(norm)
+            if asset is not None and snap.feed_source != "SIMULATED-FALLBACK":
+                current_oi = float(asset.open_interest)
+        except Exception:
+            current_oi = 0.0
+
+        horizon = HORIZON_FOR_INTERVAL.get(interval, "15m")
+        inst = perp_instrument_id(norm)
+        bars = [
+            candle_to_dollar_bar(
+                c,
+                instrument_id=inst,
+                horizon_label=horizon,
+                open_interest=current_oi,
+                funding_rate_1h=funding_rate_for_time(funding_hist, int(c["t"]), default=0.0),
+            )
+            for c in closed
+        ]
+        avail = DataAvailability(
+            candles=True,
+            taker_flow=False,
+            liquidations=False,
+            open_interest_history=False,
+            funding_history=funding_ok,
+            feed_source="HYPERLIQUID-L1",
+        )
+        self._availability = avail
+        return bars, avail
+
+    def hourly_closes(self, coin: str, n_hours: int) -> list[tuple[int, float]]:
+        """Closed 1h candles as ``(ts_ms, close)``."""
+        norm = normalize_coin_symbol(coin)
+        now_ms = int(time.time() * 1000)
+        n_req = max(2, min(int(n_hours), HYPERLIQUID_MAX_CANDLES))
+        start_ms = now_ms - (n_req + 2) * CANDLE_INTERVAL_MS["1h"]
+        candles = fetch_hyperliquid_candles(norm, "1h", start_ms, now_ms, url=self._url, timeout_sec=self._timeout)
+        closed = [c for c in candles if int(c.get("T", 0)) + 1 <= now_ms - self._close_grace_ms]
+        return [(int(c["t"]), float(c["c"])) for c in closed[-n_req:]]
+
+    def next_closed_bars(
+        self, after_ts_open_ms: int, snapshot: MultiAssetMarketSnapshot
+    ) -> dict[str, DollarBar] | None:
+        """Return the next closed 15m candle after ``after_ts_open_ms`` for every coin, or None.
+
+        The first coin in ``coins`` sets the bar clock. Open interest, funding, mark and oracle
+        prices come from the live snapshot at poll time. A simulated snapshot yields no bars.
+        """
+        if snapshot.feed_source == "SIMULATED-FALLBACK":
+            self._availability = DataAvailability(feed_source="SIMULATED-FALLBACK")
+            return None
+        now_ms = int(time.time() * 1000)
+        step_ms = CANDLE_INTERVAL_MS["15m"]
+        start_ms = int(after_ts_open_ms) + 1
+        primary = self._coins[0]
+        try:
+            primary_candles = fetch_hyperliquid_candles(
+                primary, "15m", start_ms, now_ms, url=self._url, timeout_sec=self._timeout
+            )
+        except Exception as exc:
+            logger.warning("Hyperliquid candleSnapshot poll failed (%s); no bar this tick.", exc)
+            self._availability = self._availability.model_copy(update={"candles": False})
+            return None
+        closed = [
+            c
+            for c in primary_candles
+            if int(c["t"]) > int(after_ts_open_ms) and int(c.get("T", int(c["t"]) + step_ms - 1)) + 1 <= now_ms - self._close_grace_ms
+        ]
+        if not closed:
+            return None
+        target = closed[0]
+        t_ms = int(target["t"])
+
+        bars: dict[str, DollarBar] = {}
+        for coin in self._coins:
+            asset = snapshot.get_asset(coin)
+            oi = float(asset.open_interest) if asset is not None else 0.0
+            f1h = float(asset.funding_rate_1h) if asset is not None else 0.0
+            mark = float(asset.mark_price) if asset is not None else None
+            oracle = float(asset.oracle_price) if asset is not None else None
+            if coin == primary:
+                candle: Mapping[str, Any] | None = target
+            else:
+                try:
+                    rows = fetch_hyperliquid_candles(
+                        coin, "15m", t_ms, t_ms + step_ms - 1, url=self._url, timeout_sec=self._timeout
+                    )
+                except Exception as exc:
+                    logger.warning("Hyperliquid candle for %s at %d unavailable (%s).", coin, t_ms, exc)
+                    rows = []
+                candle = next((r for r in rows if int(r["t"]) == t_ms), None)
+            if candle is None:
+                continue
+            bars[coin] = candle_to_dollar_bar(
+                candle,
+                instrument_id=perp_instrument_id(coin),
+                horizon_label="15m",
+                open_interest=oi,
+                funding_rate_1h=f1h,
+                mark_price=mark,
+                spot_price=oracle,
+            )
+        self._availability = DataAvailability(
+            candles=True,
+            taker_flow=False,
+            liquidations=False,
+            open_interest_history=False,
+            funding_history=True,
+            feed_source=str(snapshot.feed_source),
+        )
+        return bars or None
+
+
+class ScriptedBarFeed:
+    """Deterministic bar feed for replay and tests: pre-built bars and snapshots, no network.
+
+    ``bars_by_coin`` holds chronologically ordered 15m bars per coin; ``history_by_coin`` is
+    returned by ``seed_bars``; ``snapshots`` are returned in order by ``snapshot()`` (the last one
+    repeats once exhausted).
+    """
+
+    def __init__(
+        self,
+        bars_by_coin: Mapping[str, Sequence[DollarBar]],
+        snapshots: Sequence[MultiAssetMarketSnapshot],
+        history_by_coin: Mapping[str, Sequence[DollarBar]] | None = None,
+        hourly_closes_by_coin: Mapping[str, Sequence[tuple[int, float]]] | None = None,
+        availability: DataAvailability | None = None,
+    ) -> None:
+        if not snapshots:
+            raise ValueError("ScriptedBarFeed requires at least one snapshot")
+        self._bars: dict[str, list[DollarBar]] = {
+            normalize_coin_symbol(k): list(v) for k, v in bars_by_coin.items()
+        }
+        self._history: dict[str, list[DollarBar]] = {
+            normalize_coin_symbol(k): list(v) for k, v in (history_by_coin or {}).items()
+        }
+        self._hourly: dict[str, list[tuple[int, float]]] = {
+            normalize_coin_symbol(k): [(int(t), float(p)) for t, p in v]
+            for k, v in (hourly_closes_by_coin or {}).items()
+        }
+        self._snapshots: list[MultiAssetMarketSnapshot] = list(snapshots)
+        self._snapshot_cursor: int = 0
+        self._availability = availability or DataAvailability(
+            candles=True, funding_history=True, feed_source="SCRIPTED"
+        )
+
+    @property
+    def availability(self) -> DataAvailability:
+        """Availability flags declared for the scripted data."""
+        return self._availability
+
+    @property
+    def remaining_bars(self) -> int:
+        """Bars left for the primary coin (the first key)."""
+        if not self._bars:
+            return 0
+        first = next(iter(self._bars))
+        return len(self._bars[first])
+
+    def snapshot(self) -> MultiAssetMarketSnapshot:
+        """Next scripted snapshot; the last snapshot repeats once the script is exhausted."""
+        idx = min(self._snapshot_cursor, len(self._snapshots) - 1)
+        self._snapshot_cursor += 1
+        return self._snapshots[idx]
+
+    def seed_bars(self, coin: str, n_bars: int, interval: str = "15m") -> tuple[list[DollarBar], DataAvailability]:
+        """Scripted history for ``coin``."""
+        hist = self._history.get(normalize_coin_symbol(coin), [])
+        return list(hist[-max(0, int(n_bars)) :]) if n_bars > 0 else [], self._availability
+
+    def hourly_closes(self, coin: str, n_hours: int) -> list[tuple[int, float]]:
+        """Scripted hourly closes for ``coin``."""
+        series = self._hourly.get(normalize_coin_symbol(coin), [])
+        return list(series[-max(0, int(n_hours)) :])
+
+    def next_closed_bars(
+        self, after_ts_open_ms: int, snapshot: MultiAssetMarketSnapshot
+    ) -> dict[str, DollarBar] | None:
+        """Pop the next bar per coin whose open is after ``after_ts_open_ms``."""
+        out: dict[str, DollarBar] = {}
+        for coin, bars in self._bars.items():
+            while bars and bars[0].ts_open_ns // 1_000_000 <= int(after_ts_open_ms):
+                bars.pop(0)
+            if bars:
+                out[coin] = bars.pop(0)
+        return out or None

@@ -15,9 +15,11 @@ from core.models.meta_labeling_worker import (
 )
 from core.models.triple_barrier import (
     NANOSECONDS_PER_8H,
+    EWMAVolatilityEstimator,
     FeeAdjustedTripleBarrierLabeler,
     compute_causal_bar_volatility,
     compute_effective_barriers,
+    compute_ewma_volatility,
     label_single_bar_triple_barrier,
     label_triple_barrier_series,
 )
@@ -28,6 +30,7 @@ __all__ = [
     "EXTENDED_CONTINUOUS_COLUMNS",
     "NANOSECONDS_PER_8H",
     "ContinuousSVDOrthogonalizer",
+    "EWMAVolatilityEstimator",
     "DI_values",
     "FeeAdjustedTripleBarrierLabeler",
     "LightGBMMetaLabelWorker",
@@ -35,6 +38,7 @@ __all__ = [
     "compute_causal_bar_volatility",
     "compute_di_values",
     "compute_effective_barriers",
+    "compute_ewma_volatility",
     "extract_continuous_and_binary_from_snapshots",
     "label_single_bar_triple_barrier",
     "label_triple_barrier_series",

@@ -285,6 +285,96 @@ def label_triple_barrier_series(
     return labels
 
 
+def compute_ewma_volatility(
+    log_returns: Sequence[float] | npt.NDArray[np.float64],
+    span: int = 96,
+    min_sigma: float = 1e-4,
+) -> npt.NDArray[np.float64]:
+    """Exponentially weighted volatility of bar log returns (strictly causal).
+
+    ``sigma_t = sqrt((1 - alpha) * sigma_{t-1}^2 + alpha * r_t^2)`` with ``alpha = 2 / (span + 1)``,
+    seeded with the first squared return. With ``span = 96`` on 15-minute bars the half-life is
+    roughly 16.5 hours. Used in the live loop instead of a constant ``sigma_bar``.
+    """
+    if span < 1:
+        raise ValueError(f"span must be >= 1, got {span}")
+    if min_sigma <= 0.0:
+        raise ValueError(f"min_sigma must be > 0.0, got {min_sigma}")
+    rets = np.asarray(log_returns, dtype=np.float64).reshape(-1)
+    out = np.empty(rets.shape[0], dtype=np.float64)
+    if rets.shape[0] == 0:
+        return out
+    alpha = 2.0 / (float(span) + 1.0)
+    var = float(rets[0] * rets[0])
+    out[0] = max(math.sqrt(var), min_sigma)
+    for t in range(1, rets.shape[0]):
+        var = (1.0 - alpha) * var + alpha * float(rets[t] * rets[t])
+        out[t] = max(math.sqrt(var), min_sigma)
+    return out
+
+
+class EWMAVolatilityEstimator:
+    """Stateful online EWMA volatility of log returns (span-based, causal)."""
+
+    def __init__(self, span: int = 96, min_sigma: float = 1e-4) -> None:
+        if span < 1:
+            raise ValueError(f"span must be >= 1, got {span}")
+        if min_sigma <= 0.0:
+            raise ValueError(f"min_sigma must be > 0.0, got {min_sigma}")
+        self._span = span
+        self._alpha = 2.0 / (float(span) + 1.0)
+        self._min_sigma = min_sigma
+        self._variance: float | None = None
+        self._n_observations: int = 0
+
+    @property
+    def span(self) -> int:
+        """EWMA span in bars."""
+        return self._span
+
+    @property
+    def n_observations(self) -> int:
+        """Number of log returns consumed so far."""
+        return self._n_observations
+
+    @property
+    def is_warm(self) -> bool:
+        """True once at least ``span`` returns have been observed."""
+        return self._n_observations >= self._span
+
+    @property
+    def value(self) -> float:
+        """Current sigma estimate (``min_sigma`` floor before any observation)."""
+        if self._variance is None:
+            return self._min_sigma
+        return max(math.sqrt(self._variance), self._min_sigma)
+
+    def update(self, log_return: float) -> float:
+        """Consume one log return and return the updated sigma."""
+        r2 = float(log_return) * float(log_return)
+        if self._variance is None:
+            self._variance = r2
+        else:
+            self._variance = (1.0 - self._alpha) * self._variance + self._alpha * r2
+        self._n_observations += 1
+        return self.value
+
+    def seed(self, log_returns: Sequence[float] | npt.NDArray[np.float64]) -> float:
+        """Replay a history of log returns and return the resulting sigma."""
+        for r in np.asarray(log_returns, dtype=np.float64).reshape(-1):
+            self.update(float(r))
+        return self.value
+
+    @classmethod
+    def from_bars(cls, bars: Sequence[DollarBar], span: int = 96, min_sigma: float = 1e-4) -> EWMAVolatilityEstimator:
+        """Build an estimator seeded with the close-to-close log returns of ``bars``."""
+        est = cls(span=span, min_sigma=min_sigma)
+        if len(bars) >= 2:
+            closes = np.array([math.log(max(b.close, 1e-12)) for b in bars], dtype=np.float64)
+            est.seed(np.diff(closes))
+        return est
+
+
 class FeeAdjustedTripleBarrierLabeler:
     """Stateful helper for fee-adjusted Triple-Barrier labelling over Dynamic Dollar Bars."""
 
@@ -366,9 +456,11 @@ class FeeAdjustedTripleBarrierLabeler:
 
 __all__ = [
     "NANOSECONDS_PER_8H",
+    "EWMAVolatilityEstimator",
     "FeeAdjustedTripleBarrierLabeler",
     "compute_causal_bar_volatility",
     "compute_effective_barriers",
+    "compute_ewma_volatility",
     "label_single_bar_triple_barrier",
     "label_triple_barrier_series",
 ]
