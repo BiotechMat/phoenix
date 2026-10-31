@@ -44,6 +44,19 @@ from core.contracts import (
     compute_regime_multiplier_from_asri,
 )
 from core.hardware_bootstrap import load_environment_config
+from sentiment.committee_models import (
+    AdversarialRedTeamCritic,
+    BreadthAnalystOutput,
+    CrossSectionalBreadthAnalyst,
+    MacroSentinelOutput,
+    MacroStablecoinSentinel,
+    MLXCommitteeScorer,
+    MultiAssetTelemetry,
+    PortfolioStressInput,
+    RedTeamCriticOutput,
+    RiskCommitteeConsensusEngine,
+    RiskCommitteeOutput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +160,7 @@ class RegimePublishEnvelope(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     plain_english_summary: str = Field(min_length=1, max_length=1000)
     risk_output: SystemicRiskOutput
+    committee_output: RiskCommitteeOutput | None = None
     stream_key: str = DEFAULT_REDIS_STREAM_KEY
     message_id: str = "0-1"
 
@@ -157,7 +171,7 @@ class RegimePublishEnvelope(BaseModel):
 
     def to_redis_fields(self) -> dict[str, str]:
         """Serialize envelope into flat string key-value pairs for Redis XADD."""
-        return {
+        fields = {
             "ts_ns": str(self.ts_ns),
             "asri_score": f"{self.asri_score:.6f}",
             "regime_multiplier": f"{self.regime_multiplier:.6f}",
@@ -166,6 +180,9 @@ class RegimePublishEnvelope(BaseModel):
             "plain_english_summary": self.plain_english_summary,
             "payload_json": self.risk_output.model_dump_json(),
         }
+        if self.committee_output is not None:
+            fields["committee_json"] = self.committee_output.model_dump_json()
+        return fields
 
 
 def _extract_json_candidate(raw_text: str) -> str:
@@ -683,6 +700,7 @@ class SystemicRiskIPCBus:
         self,
         risk_output: SystemicRiskOutput,
         ts_ns: int | None = None,
+        committee_output: RiskCommitteeOutput | None = None,
     ) -> RegimePublishEnvelope:
         """Compute M_regime via `compute_regime_multiplier_from_asri` and publish to IPC bus."""
         now_ns = ts_ns if ts_ns is not None else time.time_ns()
@@ -702,6 +720,7 @@ class SystemicRiskIPCBus:
             confidence=risk_output.confidence,
             plain_english_summary=risk_output.plain_english_summary,
             risk_output=risk_output,
+            committee_output=committee_output,
             stream_key=self.stream_key,
             message_id=msg_id,
         )
@@ -812,16 +831,29 @@ class PersistentMLXRiskDaemon:
             enable_redis=not config.is_mock,
         )
 
+        # 3 Committee Models & Tri-Model Consensus Engine on Apple Metal GPU
+        self.macro_sentinel: MacroStablecoinSentinel = MacroStablecoinSentinel(
+            is_mock=config.is_mock
+        )
+        self.breadth_analyst: CrossSectionalBreadthAnalyst = CrossSectionalBreadthAnalyst(
+            is_mock=config.is_mock
+        )
+        self.red_team_critic: AdversarialRedTeamCritic = AdversarialRedTeamCritic(
+            is_mock=config.is_mock
+        )
+        self.consensus_engine: RiskCommitteeConsensusEngine = RiskCommitteeConsensusEngine(
+            is_mock=config.is_mock
+        )
+        self._latest_committee_output: RiskCommitteeOutput | None = None
+
         self._initialize_singleton_batch_generator()
 
-        # Seed initial neutral baseline state on the IPC bus
-        initial_output = SystemicRiskOutput(
-            score=15.0,
-            confidence=0.85,
-            tail_risk_flag=False,
-            plain_english_summary="Persistent MLX risk daemon initialized in nominal operating regime.",
+        # Seed initial committee baseline state on the IPC bus
+        initial_committee = self.evaluate_committee()
+        initial_output = initial_committee.to_systemic_risk_output()
+        self._latest_envelope: RegimePublishEnvelope = self.ipc_bus.publish(
+            initial_output, committee_output=initial_committee
         )
-        self._latest_envelope: RegimePublishEnvelope = self.ipc_bus.publish(initial_output)
 
     @classmethod
     def get_instance(
@@ -885,6 +917,11 @@ class PersistentMLXRiskDaemon:
     def latest_regime_multiplier(self) -> float:
         """Current top-down portfolio risk multiplier M_regime in [0.0, 1.0]."""
         return self._latest_envelope.regime_multiplier
+
+    @property
+    def latest_committee_output(self) -> RiskCommitteeOutput | None:
+        """Most recent validated `RiskCommitteeOutput` from the 3-model committee."""
+        return self._latest_committee_output
 
     def set_custom_llm_responder(
         self, responder: Callable[[str], str] | None
@@ -973,35 +1010,90 @@ class PersistentMLXRiskDaemon:
 
             return self._mock_generator.generate_from_prompt(prompt)
 
+    def evaluate_committee(
+        self,
+        snapshot: MacroCryptoFeedSnapshot | None = None,
+        multi_asset_telemetry: MultiAssetTelemetry | None = None,
+        stress_input: PortfolioStressInput | None = None,
+    ) -> RiskCommitteeOutput:
+        """Evaluate the full 3-model risk committee on Apple Metal GPU (`Device(gpu, 0)`)."""
+        snap = snapshot or MacroCryptoFeedSnapshot()
+        headlines = tuple((*snap.sec_cftc_headlines, *snap.macro_headlines))
+        m_out = self.macro_sentinel.evaluate(
+            stablecoin_depeg_bps=snap.max_stablecoin_peg_deviation_bps,
+            dvol_index=snap.deribit_dvol_index,
+            dvol_zscore=snap.deribit_dvol_zscore,
+            tvl_change_24h_pct=snap.defillama_tvl_change_24h_pct,
+            fear_and_greed=snap.fear_and_greed_index,
+            headlines=headlines,
+        )
+        ma_tel = multi_asset_telemetry or MultiAssetTelemetry()
+        b_out = self.breadth_analyst.evaluate(ma_tel)
+
+        st_in = stress_input or PortfolioStressInput()
+        c_out = self.red_team_critic.evaluate(
+            st_in, funding_rates_1h=ma_tel.funding_rates_1h
+        )
+
+        committee_out = self.consensus_engine.reconcile(
+            macro_sentinel=m_out,
+            breadth_analyst=b_out,
+            red_team_critic=c_out,
+        )
+        self._latest_committee_output = committee_out
+        return committee_out
+
     def infer_from_raw_response(
         self, raw_llm_text: str | None, ts_ns: int | None = None
     ) -> RegimePublishEnvelope:
         """Validate raw LLM text via `parse_and_validate_llm_risk_json` and publish to IPC bus."""
         validated_output = parse_and_validate_llm_risk_json(raw_llm_text)
-        self._latest_envelope = self.ipc_bus.publish(validated_output, ts_ns=ts_ns)
+        self._latest_envelope = self.ipc_bus.publish(
+            validated_output, ts_ns=ts_ns, committee_output=self._latest_committee_output
+        )
         return self._latest_envelope
 
     def evaluate_snapshot_sync(
         self, snapshot: MacroCryptoFeedSnapshot
     ) -> RegimePublishEnvelope:
-        """Synchronously synthesize prompt from `snapshot`, run inference, validate, and publish."""
-        prompt = self.aggregator.synthesize_structured_prompt(snapshot)
-        try:
-            if self._custom_responder is not None:
-                raw_text = self._custom_responder(prompt)
-            elif self._using_native_mlx:
-                raw_text = self._run_native_batch_generation(prompt)
-            else:
-                raw_text = self._mock_generator.generate_json_for_snapshot(snapshot)
-        except Exception as exc:
-            logger.warning("LLM inference raised %s; applying neutral fallback.", exc)
-            fallback = SystemicRiskOutput.neutral_fallback(
-                f"Inference exception ({type(exc).__name__})."
-            )
-            self._latest_envelope = self.ipc_bus.publish(fallback, ts_ns=snapshot.ts_ns)
-            return self._latest_envelope
+        """Synchronously evaluate snapshot with 3-model risk committee on Apple Metal GPU."""
+        # 1. Always evaluate the 3-model risk committee on Apple Metal GPU
+        committee_out = self.evaluate_committee(snapshot=snapshot)
 
-        return self.infer_from_raw_response(raw_text, ts_ns=snapshot.ts_ns)
+        # 2. If a custom responder is injected (e.g. testing malformed JSON or schema fallback), honor it
+        if self._custom_responder is not None:
+            prompt = self.aggregator.synthesize_structured_prompt(snapshot)
+            raw_text = self._custom_responder(prompt)
+            return self.infer_from_raw_response(raw_text, ts_ns=snapshot.ts_ns)
+
+        # 3. If running native MLX with LLM weights loaded, execute batch generation
+        if self._using_native_mlx:
+            try:
+                prompt = self.aggregator.synthesize_structured_prompt(snapshot)
+                raw_text = self._run_native_batch_generation(prompt)
+                validated_output = parse_and_validate_llm_risk_json(raw_text)
+                if validated_output.tail_risk_flag and not committee_out.tail_risk_flag:
+                    # Upgrade committee to tail risk
+                    committee_out = self.consensus_engine.reconcile(
+                        macro_sentinel=self.macro_sentinel.evaluate(
+                            stablecoin_depeg_bps=max(snapshot.max_stablecoin_peg_deviation_bps, 120.0),
+                            headlines=tuple((*snapshot.sec_cftc_headlines, *snapshot.macro_headlines)),
+                        ),
+                        breadth_analyst=committee_out.breadth_analyst,
+                        red_team_critic=committee_out.red_team_critic,
+                    )
+                    self._latest_committee_output = committee_out
+            except Exception as exc:
+                logger.debug("Native LLM generation skipped: %s", exc)
+
+        # Publish unified committee consensus
+        risk_output = committee_out.to_systemic_risk_output()
+        self._latest_envelope = self.ipc_bus.publish(
+            risk_output,
+            ts_ns=snapshot.ts_ns,
+            committee_output=committee_out,
+        )
+        return self._latest_envelope
 
     async def evaluate_snapshot(
         self, snapshot: MacroCryptoFeedSnapshot
@@ -1039,11 +1131,22 @@ class PersistentMLXRiskDaemon:
 __all__ = [
     "DEFAULT_MODEL_ID",
     "DEFAULT_REDIS_STREAM_KEY",
+    "AdversarialRedTeamCritic",
     "AsyncSystemicFeedAggregator",
+    "BreadthAnalystOutput",
+    "CrossSectionalBreadthAnalyst",
     "DeterministicMockBatchGenerator",
     "MacroCryptoFeedSnapshot",
+    "MacroSentinelOutput",
+    "MacroStablecoinSentinel",
+    "MLXCommitteeScorer",
+    "MultiAssetTelemetry",
     "PersistentMLXRiskDaemon",
+    "PortfolioStressInput",
+    "RedTeamCriticOutput",
     "RegimePublishEnvelope",
+    "RiskCommitteeConsensusEngine",
+    "RiskCommitteeOutput",
     "SystemicRiskIPCBus",
     "parse_and_validate_llm_risk_json",
 ]

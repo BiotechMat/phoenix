@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import time
 from pathlib import Path
 from typing import Literal
@@ -13,17 +15,27 @@ import pytest
 
 from core.contracts import (
     AssetAllocationInput,
+    AssetMarketSnapshot,
     CPCVValidationResult,
     DollarBar,
     ExecutionAction,
     ExecutionRegimeMode,
     FeeSchedule,
+    L2OrderBookSnapshot,
+    MultiAssetMarketSnapshot,
     PositioningRegime,
+    SettlementCurrency,
     SystemicRiskOutput,
     TripleBarrierConfig,
     compute_fractional_kelly,
     compute_regime_multiplier_from_asri,
     compute_signed_target_weights,
+)
+from core.data_ingestion import (
+    LiveMarketDataEngine,
+    _compute_l2_depth_and_spread,
+    get_live_multi_asset_snapshot,
+    normalize_coin_symbol,
 )
 from core.execution import (
     DefensiveMakerExecutionAlgorithm,
@@ -54,13 +66,20 @@ from core.models import (
     MahalanobisOutlierGate,
     extract_continuous_and_binary_from_snapshots,
 )
-from research.validation import (
+from research.cpcv_gates import (
     ChampionChallengerGatekeeper,
     CombinatorialPurgedCV,
+    StrategyCandidate,
+    StrategyTournament,
+    TournamentCandidateResult,
+    TournamentResult,
     compute_dsr,
     compute_net_of_fee_returns,
     compute_pbo,
     compute_psr,
+    create_funding_carry_strategy,
+    create_mean_reversion_strategy,
+    create_trend_strategy,
 )
 from risk import (
     SignedHRPCVaRAllocator,
@@ -70,12 +89,31 @@ from sentiment import (
     PersistentMLXRiskDaemon,
     parse_and_validate_llm_risk_json,
 )
+from sentiment.committee_models import (
+    AdversarialRedTeamCritic,
+    BreadthAnalystOutput,
+    CrossSectionalBreadthAnalyst,
+    MacroSentinelOutput,
+    MacroStablecoinSentinel,
+    MLXCommitteeScorer,
+    MultiAssetTelemetry,
+    PortfolioStressInput,
+    RedTeamCriticOutput,
+    RiskCommitteeConsensusEngine,
+    RiskCommitteeOutput,
+)
 from sleeves.derivatives.funding_carry import FundingCarrySleeve
 from ui import (
     DOC_FILENAMES,
     PLAIN_ENGLISH_TOOLTIPS,
     PlainEnglishTelegramBot,
     create_app,
+)
+from ui.api_server import (
+    AccountLedgerData,
+    ControlCenterStateStore,
+    LEDGER_FILE,
+    TradeForensicRecord,
 )
 
 
@@ -752,3 +790,404 @@ def test_web_ui_control_center_telegram_and_layman_docs() -> None:
     for cmd in ("/status", "/profit", "/gates", "/explain", "/pause", "/flat"):
         reply = bot.handle_command(cmd)
         assert len(reply) > 20
+
+
+# ==============================================================================
+# 6. ARCHITECTURE SPECIFICATION VERIFICATION (M1-M5 COMPLETE PLATFORM INVARIANTS)
+# ==============================================================================
+
+
+def test_account_ledger_restart_durability(tmp_path: Path) -> None:
+    """Verify ControlCenterStateStore retains $5,000 base capital, accumulated PnL, trades, and win/loss across shutdown & reboot."""
+    test_ledger = tmp_path / "account_ledger.json"
+
+    # 1. Fresh state initialization asserts $5,000 base capital and creates atomic ledger file
+    store_session_1 = ControlCenterStateStore(ledger_path=test_ledger)
+    assert store_session_1.ledger_summary["base_capital_usd"] == 5000.0
+    assert store_session_1.ledger_summary["current_equity_usd"] == 5000.0
+    assert store_session_1.ledger_summary["total_realized_pnl"] == 0.0
+    assert store_session_1.ledger_summary["win_count"] == 0
+    assert store_session_1.ledger_summary["loss_count"] == 0
+    assert store_session_1.ledger_summary["total_trades"] == 0
+    assert test_ledger.exists()
+
+    # Verify on-disk initial state conforms to AccountLedgerData contract
+    raw_disk_1 = json.loads(test_ledger.read_text(encoding="utf-8"))
+    ledger_data_1 = AccountLedgerData(**raw_disk_1)
+    assert ledger_data_1.base_capital_usd == 5000.0
+    assert ledger_data_1.current_cash_usd == 5000.0
+    assert ledger_data_1.total_trades == 0
+
+    # 2. Advance simulated trading engine by 4 bars to accumulate trades and PnL
+    for _ in range(4):
+        store_session_1.step_simulation_tick()
+
+    accumulated_pnl = store_session_1.ledger_summary["total_realized_pnl"]
+    wins = store_session_1.ledger_summary["win_count"]
+    losses = store_session_1.ledger_summary["loss_count"]
+    trades_count = store_session_1.ledger_summary["total_trades"]
+    assert trades_count == 4
+    assert wins + losses == 4
+    assert store_session_1.latest_forensic is not None
+    last_trade_id = store_session_1.latest_forensic["trade_id"]
+    last_equity = store_session_1.ledger_summary["current_equity_usd"]
+    assert last_equity == pytest.approx(5000.0 + accumulated_pnl, rel=1e-5)
+
+    # Verify disk matches in-memory session 1 before shutdown
+    raw_disk_before_shutdown = json.loads(test_ledger.read_text(encoding="utf-8"))
+    assert raw_disk_before_shutdown["base_capital_usd"] == 5000.0
+    assert raw_disk_before_shutdown["total_realized_pnl"] == round(accumulated_pnl, 2)
+    assert raw_disk_before_shutdown["win_count"] == wins
+    assert raw_disk_before_shutdown["loss_count"] == losses
+    assert len(raw_disk_before_shutdown["trade_history"]) == 4
+
+    # 3. Simulate server shutdown: tear down session 1
+    del store_session_1
+
+    # 4. Simulate server restart: initialize fresh store instance pointing to same ledger file
+    store_session_2 = ControlCenterStateStore(ledger_path=test_ledger)
+    assert store_session_2.ledger_summary["base_capital_usd"] == 5000.0
+    assert store_session_2.ledger_summary["total_realized_pnl"] == pytest.approx(accumulated_pnl, rel=1e-5)
+    assert store_session_2.ledger_summary["win_count"] == wins
+    assert store_session_2.ledger_summary["loss_count"] == losses
+    assert store_session_2.ledger_summary["total_trades"] == 4
+    assert store_session_2.latest_forensic is not None
+    assert store_session_2.latest_forensic["trade_id"] == last_trade_id
+    assert store_session_2.ledger_summary["current_equity_usd"] == pytest.approx(last_equity, rel=1e-5)
+
+    # 5. Execute 5th trade on restarted server and verify persistence continues seamlessly
+    store_session_2.step_simulation_tick()
+    assert store_session_2.ledger_summary["total_trades"] == 5
+    assert store_session_2.ledger_summary["win_count"] + store_session_2.ledger_summary["loss_count"] == 5
+
+    raw_disk_after_reboot = json.loads(test_ledger.read_text(encoding="utf-8"))
+    ledger_data_reboot = AccountLedgerData(**raw_disk_after_reboot)
+    assert ledger_data_reboot.base_capital_usd == 5000.0
+    assert ledger_data_reboot.total_trades == 5
+    assert ledger_data_reboot.current_equity_usd == pytest.approx(
+        5000.0 + store_session_2.ledger_summary["total_realized_pnl"], rel=1e-5
+    )
+
+    # 6. Also verify that standard project ledger path (LEDGER_FILE) exists with valid structure
+    if LEDGER_FILE.exists():
+        prod_disk = json.loads(LEDGER_FILE.read_text(encoding="utf-8"))
+        prod_ledger = AccountLedgerData(**prod_disk)
+        assert prod_ledger.base_capital_usd > 0.0
+        assert prod_ledger.account_id == "hyperliquid_paper_01"
+
+
+def test_trade_forensics_feature_attribution_endpoint(tmp_path: Path) -> None:
+    """Verify /api/forensics endpoint returns structured 10-factor feature attribution and 'Why Did It Trade?' rationale."""
+    test_ledger = tmp_path / "forensics_ledger.json"
+    store = ControlCenterStateStore(ledger_path=test_ledger)
+    app = create_app(store)
+    client = TestClient(app)
+
+    # 1. Advance simulation by stepping 2 bars to ensure trade and forensic generation
+    resp_tick1 = client.post("/api/tick")
+    assert resp_tick1.status_code == 200
+    resp_tick2 = client.post("/api/tick")
+    assert resp_tick2.status_code == 200
+
+    # 2. Query /api/forensics endpoint
+    resp_forensics = client.get("/api/forensics")
+    assert resp_forensics.status_code == 200
+    data = resp_forensics.json()
+
+    assert data["status"] == "ok"
+    assert data["total_records"] >= 2
+    assert len(data["records"]) >= 2
+    assert "risk_committee" in data
+    assert "sleeve_telemetry" in data
+    assert "ledger_summary" in data
+
+    # 3. Verify the latest forensic record structure and typing
+    latest = data["latest"]
+    assert latest is not None
+    assert isinstance(latest, dict)
+
+    # Validate against TradeForensicRecord schema
+    validated_record = TradeForensicRecord(**latest)
+    assert validated_record.fill_price > 0.0
+    assert validated_record.notional_usd >= 0.0
+    assert 0.0 <= validated_record.p_meta <= 1.0
+    assert validated_record.mahalanobis_di >= 0.0
+    assert 0.0 <= validated_record.vpin <= 1.0
+    assert validated_record.hawkes_eta >= 0.0
+    assert 0.0 <= validated_record.asri_score <= 100.0
+    assert 0.0 <= validated_record.m_regime <= 1.0
+    assert 0.0 <= validated_record.kelly_fraction <= 1.0
+
+    # 4. Verify 'Why Did It Trade?' plain-English decision rationale
+    why_text = validated_record.why_did_it_trade
+    assert isinstance(why_text, str)
+    assert len(why_text) >= 30
+    assert any(
+        term in why_text.lower()
+        for term in ("meta-conviction", "mahalanobis", "vpin", "regime", "risk", "kelly")
+    )
+
+    # 5. Verify 10-factor feature attribution dictionary
+    feat_attr = validated_record.feature_attribution
+    assert isinstance(feat_attr, dict)
+    expected_10_factors = {
+        "ffd_close_zscore",
+        "ffd_oi_zscore",
+        "oi_funding_basis_zscore",
+        "basis_pct",
+        "funding_rate_1h",
+        "funding_rate_8h",
+        "liquidation_zscore",
+        "regime_weight_bps",
+        "kelly_conviction",
+        "m_regime_multiplier",
+    }
+    assert set(feat_attr.keys()) == expected_10_factors
+    for factor_name, factor_val in feat_attr.items():
+        assert isinstance(factor_val, (int, float)), f"Factor {factor_name} is not numeric: {type(factor_val)}"
+        assert not math.isnan(factor_val), f"Factor {factor_name} is NaN"
+        assert not math.isinf(factor_val), f"Factor {factor_name} is infinite"
+
+
+def test_hyperliquid_live_ingestion_and_fee_schedule() -> None:
+    """Verify Hyperliquid L1 ingestion contracts (FeeSchedule.hyperliquid(), 1.5 bps maker fee, 1h funding sync)."""
+    # 1. Hyperliquid fee schedule verification
+    hl_fee = FeeSchedule.hyperliquid()
+    assert hl_fee.settlement == SettlementCurrency.USDC
+    assert hl_fee.maker_bps == 1.5
+    assert hl_fee.taker_bps == 4.5
+    assert hl_fee.estimated_slippage_bps == 0.5
+    assert hl_fee.maker_rate == pytest.approx(0.00015, rel=1e-7)
+    assert hl_fee.taker_rate == pytest.approx(0.00045, rel=1e-7)
+    assert hl_fee.roundtrip_maker_bps == 3.0
+    assert hl_fee.roundtrip_maker_plus_slippage_bps == 4.0
+
+    # 2. Multi-asset symbol normalization across Hyperliquid universe
+    assert normalize_coin_symbol("BTC") == "BTC"
+    assert normalize_coin_symbol("BTCUSDT-PERP") == "BTC"
+    assert normalize_coin_symbol("ETHUSDC-PERP") == "ETH"
+    assert normalize_coin_symbol("SOL-PERP") == "SOL"
+    assert normalize_coin_symbol("eth") == "ETH"
+    assert normalize_coin_symbol("sol") == "SOL"
+
+    # 3. Top-20 L2 order book depth and spread calculation
+    bids = [(65000.0 - i * 5.0, 0.5 + i * 0.1) for i in range(20)]
+    asks = [(65005.0 + i * 5.0, 0.5 + i * 0.1) for i in range(20)]
+    spread_bps, depth_10bps, depth_50bps = _compute_l2_depth_and_spread(bids, asks)
+    assert spread_bps == pytest.approx(0.769, abs=0.1)
+    assert depth_10bps > 0.0
+    assert depth_50bps >= depth_10bps
+
+    # 4. Ingestion engine contracts & fallback generation
+    engine = LiveMarketDataEngine()
+    assert engine.hl_url == "https://api.hyperliquid.xyz/info"
+    assert engine.bybit_tickers_url == "https://api.bybit.com/v5/market/tickers"
+    assert engine.bybit_book_url == "https://api.bybit.com/v5/market/orderbook"
+
+    sim_snap = engine.create_simulated_snapshot(coins=("BTC", "ETH", "SOL"))
+    assert isinstance(sim_snap, MultiAssetMarketSnapshot)
+    assert set(sim_snap.assets.keys()) == {"BTC", "ETH", "SOL"}
+
+    for coin in ("BTC", "ETH", "SOL"):
+        asset_snap = sim_snap.get_asset(coin)
+        assert asset_snap is not None
+        assert asset_snap.mid_price > 0.0
+        assert asset_snap.mark_price > 0.0
+        assert asset_snap.oracle_price > 0.0
+        assert asset_snap.open_interest > 0.0
+        assert isinstance(asset_snap.funding_rate_1h, float)
+        # 1-hour funding rate synchronized to 8-hour equivalent
+        assert asset_snap.funding_rate_8h_equiv == pytest.approx(asset_snap.funding_rate_1h * 8.0, rel=1e-3)
+        assert asset_snap.l2_book is not None
+        assert len(asset_snap.l2_book.bids) == 20
+        assert len(asset_snap.l2_book.asks) == 20
+        assert asset_snap.l2_book.spread_bps >= 0.0
+        assert asset_snap.l2_book.depth_10bps_usd > 0.0
+
+    # 5. Live/cached multi-asset snapshot retrieval
+    live_snap = get_live_multi_asset_snapshot(coins=("BTC", "ETH", "SOL"), include_l2=True)
+    assert isinstance(live_snap, MultiAssetMarketSnapshot)
+    assert "BTC" in live_snap.assets
+    assert "ETH" in live_snap.assets
+    assert "SOL" in live_snap.assets
+    assert live_snap.feed_source in ("HYPERLIQUID-L1", "BYBIT-FAILOVER", "FALLBACK-SIMULATED")
+
+
+def test_mlx_risk_committee_consensus() -> None:
+    """Verify 3-model MLX risk committee (Sentinel, Breadth, Critic) consensus on Metal GPU."""
+    import mlx.core as mx
+
+    sentinel = MacroStablecoinSentinel()
+    breadth = CrossSectionalBreadthAnalyst()
+    critic = AdversarialRedTeamCritic()
+    consensus_engine = RiskCommitteeConsensusEngine()
+
+    # 1. Model 1: Macro / Stablecoin Sentinel evaluation
+    out_sentinel_normal = sentinel.evaluate(stablecoin_depeg_bps=1.2, dvol_index=48.0, tvl_change_24h_pct=0.01)
+    assert out_sentinel_normal.score < 35.0
+    assert out_sentinel_normal.tail_risk_flag is False
+    assert out_sentinel_normal.regime_label == "STABLE_EXPANSION"
+
+    out_sentinel_depeg = sentinel.evaluate(stablecoin_depeg_bps=80.0, dvol_index=90.0, tvl_change_24h_pct=-35.0)
+    assert out_sentinel_depeg.score >= 80.0
+    assert out_sentinel_depeg.tail_risk_flag is True
+    assert out_sentinel_depeg.regime_label == "ACUTE_MACRO_CRISIS"
+
+    # 2. Model 2: Cross-Sectional Breadth Analyst evaluation
+    telemetry = MultiAssetTelemetry(
+        asset_prices={"BTC": 67500.0, "ETH": 3480.0, "SOL": 178.5},
+        funding_rates_1h={"BTC": 0.000012, "ETH": 0.000015, "SOL": 0.000020},
+    )
+    out_breadth = breadth.evaluate(telemetry)
+    assert 0.0 <= out_breadth.breadth_score <= 100.0
+    assert out_breadth.dispersion_bps >= 0.0
+    assert 0.0 <= out_breadth.correlation_dispersion <= 2.0
+    assert 0.0 <= out_breadth.confidence <= 1.0
+
+    # 3. Model 3: Adversarial Red-Team Critic evaluation
+    stress_safe = PortfolioStressInput(gross_leverage=1.1, vpin=0.22, hawkes_eta=0.28)
+    out_critic_safe = critic.evaluate(stress_safe)
+    assert out_critic_safe.criticism_score < 40.0
+    assert out_critic_safe.veto_active is False
+    assert out_critic_safe.haircut_multiplier >= 0.85
+
+    stress_cascade = PortfolioStressInput(
+        gross_leverage=3.2,
+        vpin=0.82,
+        hawkes_eta=0.91,
+        liquidation_volume_usd=5_000_000.0,
+    )
+    out_critic_toxic = critic.evaluate(stress_cascade)
+    assert out_critic_toxic.criticism_score >= 80.0
+    assert out_critic_toxic.haircut_multiplier < 0.5 or out_critic_toxic.veto_active
+
+    # 4. Tri-Model Consensus Engine on Metal GPU / MLX
+    consensus_normal = consensus_engine.reconcile(out_sentinel_normal, out_breadth, out_critic_safe)
+    assert isinstance(consensus_normal, RiskCommitteeOutput)
+    assert 0.0 <= consensus_normal.consensus_risk_score <= 50.0
+    assert consensus_normal.regime_multiplier > 0.70
+    assert consensus_normal.tail_risk_flag is False
+    assert len(consensus_normal.committee_rationale) > 20
+
+    # Test Metal GPU neural scorer tensor execution
+    feat_tensor = mx.ones((1, 16), dtype=mx.float32)
+    weights = consensus_engine.scorer(feat_tensor)
+    mx.eval(weights)
+    assert weights.shape == (1, 1)
+    scorer_scalar = float(weights[0, 0])
+    assert not math.isnan(scorer_scalar) and not math.isinf(scorer_scalar)
+
+    # Veto condition: acute depeg shock engages full trading halt
+    consensus_veto = consensus_engine.reconcile(out_sentinel_depeg, out_breadth, out_critic_safe)
+    assert consensus_veto.tail_risk_flag is True
+    assert consensus_veto.regime_multiplier == 0.0
+    assert consensus_veto.consensus_risk_score >= 95.0
+    assert "VETO ENGAGED" in consensus_veto.committee_rationale
+
+    # Convert to SystemicRiskOutput
+    sys_out = consensus_normal.to_systemic_risk_output()
+    assert isinstance(sys_out, SystemicRiskOutput)
+    assert sys_out.score == consensus_normal.consensus_risk_score
+    assert sys_out.tail_risk_flag == consensus_normal.tail_risk_flag
+
+
+def test_cpcv_tournament_and_meta_model() -> None:
+    """Verify 45-split CPCV gate, DSR evaluation, and automated strategy tournament."""
+    # 1. 45-split CPCV structure and zero label overlap
+    cpcv = CombinatorialPurgedCV(vertical_barrier_bars=16, n_groups=10, k_test_groups=2, embargo_pct=0.01)
+    assert cpcv.num_splits == 45
+    assert cpcv.n_oos_paths == 9
+    assert cpcv.purge_bars == 16
+
+    splits = cpcv.generate_splits(n_samples=500)
+    assert len(splits) == 45
+    assert cpcv.verify_zero_label_overlap(splits, label_horizon_bars=16) is True
+
+    # 2. Deflated Sharpe Ratio (DSR) & PBO computation
+    # Test selection bias penalty: DSR with 45 trials is strictly lower than single-trial PSR
+    rng_dsr = np.random.default_rng(2026)
+    ret_normal = rng_dsr.normal(0.001, 0.015, size=250)
+    ret_fat_tails = ret_normal.copy()
+    ret_fat_tails[::25] -= 0.08  # inject negative tail shocks
+
+    dsr_single = compute_dsr(ret_normal, total_trials=1)
+    dsr_multi_45 = compute_dsr(ret_normal, total_trials=45)
+    assert dsr_single > dsr_multi_45
+
+    # Test negative skew and excess kurtosis penalties
+    dsr_fat_tails = compute_dsr(ret_fat_tails, total_trials=45)
+    assert dsr_fat_tails <= dsr_multi_45
+
+    # Test PBO computation
+    rng = np.random.default_rng(2026)
+    is_matrix = rng.normal(0.001, 0.02, size=(45, 4))
+    oos_matrix = rng.normal(0.0008, 0.02, size=(45, 4))
+    pbo = compute_pbo(is_matrix, oos_matrix)
+    assert 0.0 <= pbo <= 1.0
+
+    # 3. Automated StrategyTournament execution
+    bars = _make_synthetic_dollar_bars(n_bars=220, seed=777)
+    tourney = StrategyTournament(tournament_id="phoenix_cpcv_tourney", vertical_barrier_bars=16)
+    tourney.add_candidate(create_trend_strategy("trend_fast", fast_window=6, slow_window=18))
+    tourney.add_candidate(create_trend_strategy("trend_slow", fast_window=12, slow_window=36))
+    tourney.add_candidate(create_funding_carry_strategy("carry_standard", entry_threshold_bps=0.5))
+
+    assert len(tourney.candidates) == 3
+    result = tourney.run_tournament(bars, parallel=False)
+
+    assert isinstance(result, TournamentResult)
+    assert result.total_candidates == 3
+    assert len(result.rankings) == 3
+    assert 0.0 <= result.tournament_pbo <= 1.0
+    assert result.pool_sharpe_std >= 0.0
+
+    for cand_res in result.rankings:
+        assert isinstance(cand_res, TournamentCandidateResult)
+        assert cand_res.cpcv_result.total_trials == 3
+        assert 0.0 <= cand_res.dsr <= 1.0
+        assert 0.0 <= cand_res.psr_vs_zero <= 1.0
+        assert 0.0 <= cand_res.pbo <= 1.0
+        assert cand_res.promotion_status in ("PROMOTED_CHAMPION", "QUALIFIED_CONTENDER", "REJECTED_GATES_FAILED")
+
+    if result.champion is not None:
+        assert result.champion.passed_all_gates is True
+        assert result.champion.promotion_status == "PROMOTED_CHAMPION"
+
+    # 4. Triple Barrier and Meta-Model Bridge
+    tb_cfg = TripleBarrierConfig(pt_sigma_mult=2.0)
+    labeler = FeeAdjustedTripleBarrierLabeler(tb_cfg)
+    labels = labeler.label_bars(bars[:100], primary_directions=np.ones(100, dtype=np.int64))
+    assert len(labels) == 100
+    for lbl in labels:
+        assert lbl.upper_barrier >= 0.0080  # >= 80 bps hurdle
+
+    snaps = compute_positioning_snapshots(bars[:100])
+    x_cont, bin_flags, _ = extract_continuous_and_binary_from_snapshots(snaps)
+    y_meta = np.array([lbl.meta_label for lbl in labels], dtype=np.int64)
+    if np.unique(y_meta).size < 2:
+        y_meta[:20] = 1
+        y_meta[20:40] = 0
+
+    worker = LightGBMMetaLabelWorker(di_threshold=3.5, n_jobs=2)
+    worker.fit(x_cont, y_meta, liquidation_exhaustion_flag_train=bin_flags)
+
+    pred_normal = worker.predict_single(
+        instrument_id="BTCUSDT-PERP",
+        ts_close_ns=bars[50].ts_close_ns,
+        x_continuous_row=x_cont[50],
+        liquidation_exhaustion_flag=0,
+        primary_direction=1,
+    )
+    assert 0.0 <= pred_normal.p_meta <= 1.0
+
+    # Mahalanobis epistemic gate blocks out-of-distribution vector
+    pred_outlier = worker.predict_single(
+        instrument_id="BTCUSDT-PERP",
+        ts_close_ns=bars[50].ts_close_ns,
+        x_continuous_row=x_cont[50] + 60.0,
+        liquidation_exhaustion_flag=0,
+        primary_direction=1,
+    )
+    assert pred_outlier.epistemic_gate_passed is False
+    assert pred_outlier.effective_direction == 0
+

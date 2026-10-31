@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -47,6 +47,16 @@ class FeeSchedule(BaseModel):
             estimated_slippage_bps=1.0,
         )
 
+    @classmethod
+    def hyperliquid(cls) -> FeeSchedule:
+        """Standard base-tier Hyperliquid L1 perpetual fee schedule (1.5 bps Maker / 4.5 bps Taker)."""
+        return cls(
+            settlement=SettlementCurrency.USDC,
+            maker_bps=1.5,
+            taker_bps=4.5,
+            estimated_slippage_bps=0.5,
+        )
+
     @property
     def maker_rate(self) -> float:
         """Maker fee as decimal fraction."""
@@ -86,16 +96,249 @@ class DollarBar(BaseModel):
     buy_dollar_volume: float = Field(ge=0.0)
     sell_dollar_volume: float = Field(ge=0.0)
     open_interest: float = Field(ge=0.0)
-    funding_rate_8h: float = Field(description="Current 8-hour funding rate as decimal (e.g. 0.0005 = 5 bps)")
+    funding_rate_8h: float = Field(
+        default=0.0, description="Current 8-hour funding rate as decimal (e.g. 0.0005 = 5 bps)"
+    )
+    funding_rate_1h: float = Field(
+        default=0.0, description="Current 1-hour funding rate as decimal"
+    )
     mark_price: float = Field(gt=0.0)
     spot_price: float = Field(gt=0.0)
     liquidation_volume_usd: float = Field(default=0.0, ge=0.0)
     tick_count: int = Field(default=1, ge=1)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_funding_rates(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            d = dict(data)
+            has_1h = "funding_rate_1h" in d and d["funding_rate_1h"] is not None
+            has_8h = "funding_rate_8h" in d and d["funding_rate_8h"] is not None
+            if has_1h and not has_8h:
+                d["funding_rate_8h"] = float(d["funding_rate_1h"]) * 8.0
+            elif has_8h and not has_1h:
+                d["funding_rate_1h"] = float(d["funding_rate_8h"]) / 8.0
+            elif has_1h and has_8h:
+                v1 = float(d["funding_rate_1h"])
+                v8 = float(d["funding_rate_8h"])
+                if v1 != 0.0 and v8 == 0.0:
+                    d["funding_rate_8h"] = v1 * 8.0
+                elif v8 != 0.0 and v1 == 0.0:
+                    d["funding_rate_1h"] = v8 / 8.0
+            return d
+        return data
+
     @property
     def basis(self) -> float:
         """Mark-to-spot relative basis: (Mark - Spot) / Spot."""
         return (self.mark_price - self.spot_price) / self.spot_price
+
+
+class L2Level(BaseModel):
+    """Single price level in an L2 order book."""
+
+    model_config = ConfigDict(frozen=True)
+
+    price: float = Field(gt=0.0, description="Limit price level")
+    size: float = Field(ge=0.0, description="Aggregated size at level")
+    order_count: int = Field(default=1, ge=0, description="Number of resting orders")
+
+
+class L2OrderBookSnapshot(BaseModel):
+    """Top-20 L2 order book depth snapshot for an asset."""
+
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: str = Field(default="", description="Asset / symbol ID (e.g. BTC)")
+    bids: list[tuple[float, float]] = Field(
+        default_factory=list, description="Top bids as (price, size) tuples descending"
+    )
+    asks: list[tuple[float, float]] = Field(
+        default_factory=list, description="Top asks as (price, size) tuples ascending"
+    )
+    levels_bids: list[L2Level] = Field(default_factory=list, description="Structured bid levels")
+    levels_asks: list[L2Level] = Field(default_factory=list, description="Structured ask levels")
+    spread_bps: float = Field(default=0.0, description="Top-of-book spread in basis points")
+    depth_10bps_usd: float = Field(default=0.0, description="Available passive depth within 10 bps in USD")
+    depth_50bps_usd: float = Field(default=0.0, description="Available passive depth within 50 bps in USD")
+    timestamp_ns: int = Field(default=0, ge=0, description="Snapshot timestamp in nanoseconds")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_levels_and_metrics(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            d = dict(data)
+            raw_bids = d.get("bids", [])
+            raw_asks = d.get("asks", [])
+            levels_bids = d.get("levels_bids", [])
+            levels_asks = d.get("levels_asks", [])
+
+            # Sync tuples to L2Level
+            if raw_bids and not levels_bids:
+                d["levels_bids"] = [
+                    L2Level(price=float(b[0]), size=float(b[1]), order_count=1)
+                    if isinstance(b, (tuple, list))
+                    else b
+                    for b in raw_bids
+                ]
+            elif levels_bids and not raw_bids:
+                d["bids"] = [
+                    (float(lvl.price), float(lvl.size))
+                    if hasattr(lvl, "price")
+                    else (float(lvl["price"]), float(lvl["size"]))
+                    for lvl in levels_bids
+                ]
+
+            if raw_asks and not levels_asks:
+                d["levels_asks"] = [
+                    L2Level(price=float(a[0]), size=float(a[1]), order_count=1)
+                    if isinstance(a, (tuple, list))
+                    else a
+                    for a in raw_asks
+                ]
+            elif levels_asks and not raw_asks:
+                d["asks"] = [
+                    (float(lvl.price), float(lvl.size))
+                    if hasattr(lvl, "price")
+                    else (float(lvl["price"]), float(lvl["size"]))
+                    for lvl in levels_asks
+                ]
+
+            bids_list = d.get("bids", [])
+            asks_list = d.get("asks", [])
+
+            # Auto-calculate spread_bps if 0.0 or missing
+            if bids_list and asks_list and not d.get("spread_bps"):
+                best_bid = float(bids_list[0][0])
+                best_ask = float(asks_list[0][0])
+                mid = (best_bid + best_ask) / 2.0
+                if mid > 0:
+                    d["spread_bps"] = round((best_ask - best_bid) / mid * 10_000.0, 3)
+
+            # Auto-calculate depth_10bps_usd if 0.0 or missing
+            if bids_list and asks_list and not d.get("depth_10bps_usd"):
+                best_bid = float(bids_list[0][0])
+                best_ask = float(asks_list[0][0])
+                mid = (best_bid + best_ask) / 2.0
+                thresh_bid = mid * (1.0 - 0.0010)
+                thresh_ask = mid * (1.0 + 0.0010)
+                bid_depth = sum(float(p) * float(sz) for p, sz in bids_list if float(p) >= thresh_bid)
+                ask_depth = sum(float(p) * float(sz) for p, sz in asks_list if float(p) <= thresh_ask)
+                d["depth_10bps_usd"] = round(bid_depth + ask_depth, 2)
+
+            return d
+        return data
+
+
+class AssetMarketSnapshot(BaseModel):
+    """Real-time market snapshot for a single perpetual asset."""
+
+    model_config = ConfigDict(frozen=True)
+
+    instrument_id: str = Field(description="Asset identifier, e.g. BTC, ETH, SOL")
+    mid_price: float = Field(gt=0.0, description="Top-of-book mid price")
+    mark_price: float = Field(gt=0.0, description="Perpetual mark price")
+    oracle_price: float = Field(gt=0.0, description="Spot oracle index price")
+    open_interest: float = Field(ge=0.0, description="Open interest in base asset contracts")
+    funding_rate_1h: float = Field(default=0.0, description="Current 1-hour funding rate as decimal")
+    funding_rate_8h_equiv: float = Field(
+        default=0.0, description="8-hour equivalent funding rate (funding_rate_1h * 8)"
+    )
+    day_volume_usd: float = Field(default=0.0, ge=0.0, description="24-hour notional volume in USD")
+    l2_book: L2OrderBookSnapshot = Field(
+        default_factory=L2OrderBookSnapshot, description="Top-20 L2 order book snapshot"
+    )
+    annualized_apr_pct: float = Field(
+        default=0.0, description="Annualized funding APR percentage (funding_rate_1h * 24 * 365 * 100)"
+    )
+    basis_bps: float = Field(default=0.0, description="Mark-to-oracle basis in basis points")
+    feed_source: Literal["HYPERLIQUID-L1", "BYBIT-V5-FALLBACK", "SIMULATED-FALLBACK"] = "HYPERLIQUID-L1"
+    timestamp_ns: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_metrics(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            d = dict(data)
+            f1 = float(d.get("funding_rate_1h", 0.0))
+            f8 = float(d.get("funding_rate_8h_equiv", 0.0))
+            if f1 != 0.0 and f8 == 0.0:
+                d["funding_rate_8h_equiv"] = f1 * 8.0
+            elif f8 != 0.0 and f1 == 0.0:
+                d["funding_rate_1h"] = f8 / 8.0
+                f1 = d["funding_rate_1h"]
+
+            if not d.get("annualized_apr_pct") and f1 != 0.0:
+                d["annualized_apr_pct"] = round(f1 * 24.0 * 365.0 * 100.0, 4)
+
+            mark = float(d.get("mark_price", 0.0))
+            oracle = float(d.get("oracle_price", 0.0))
+            if mark > 0 and oracle > 0 and not d.get("basis_bps"):
+                d["basis_bps"] = round((mark - oracle) / oracle * 10_000.0, 3)
+
+            return d
+        return data
+
+
+class MultiAssetMarketSnapshot(BaseModel):
+    """Simultaneous multi-asset market data snapshot (BTC, ETH, SOL)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    timestamp_ns: int = Field(ge=0, description="Snapshot timestamp in nanoseconds")
+    assets: dict[str, AssetMarketSnapshot] = Field(
+        description="Per-asset market snapshots keyed by asset symbol (BTC, ETH, SOL)"
+    )
+    feed_source: Literal["HYPERLIQUID-L1", "BYBIT-V5-FALLBACK", "SIMULATED-FALLBACK"] = "HYPERLIQUID-L1"
+
+    def get_asset(self, coin: str) -> AssetMarketSnapshot | None:
+        """Retrieve snapshot for a given coin symbol or normalized ticker."""
+        clean = (
+            coin.strip()
+            .upper()
+            .removesuffix("USDT-PERP")
+            .removesuffix("-PERP")
+            .removesuffix("USDT")
+            .removesuffix("USD")
+        )
+        return self.assets.get(clean) or self.assets.get(coin)
+
+    @property
+    def btc(self) -> AssetMarketSnapshot | None:
+        return self.assets.get("BTC")
+
+    @property
+    def eth(self) -> AssetMarketSnapshot | None:
+        return self.assets.get("ETH")
+
+    @property
+    def sol(self) -> AssetMarketSnapshot | None:
+        return self.assets.get("SOL")
+
+
+class DeribitOptionsSurface(BaseModel):
+    """Deribit options surface metrics for volatility and gamma analysis."""
+
+    model_config = ConfigDict(frozen=True)
+
+    currency: str = "BTC"
+    skew_25d: float = 0.0
+    term_structure_slope: float = 0.0
+    net_gex_usd: float = 0.0
+    dvol_annualized: float = 0.0
+    timestamp_ns: int = 0
+
+
+class HyperliquidWhaleVaultMetrics(BaseModel):
+    """Hyperliquid HLP and whale vault positioning metrics."""
+
+    model_config = ConfigDict(frozen=True)
+
+    vault_address: str = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+    tvl_usd: float = 0.0
+    net_delta_usd: float = 0.0
+    hlp_crowding: Literal["CROWDED_LONG", "CROWDED_SHORT", "BALANCED"] = "BALANCED"
+    timestamp_ns: int = 0
 
 
 class FFDWeightsConfig(BaseModel):

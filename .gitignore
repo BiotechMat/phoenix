@@ -1,5 +1,6 @@
 # Virtual environments & caches
 .venv/
+.agents/
 logs/
 data/*.parquet
 __pycache__/

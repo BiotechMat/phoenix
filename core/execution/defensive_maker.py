@@ -22,6 +22,7 @@ Implements `DefensiveMakerExecutionAlgorithm` compatible with NautilusTrader's `
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,6 +37,43 @@ from core.execution.vpin_hawkes import (
     RecursiveHawkesMonitor,
     RollingBVCVPINMonitor,
 )
+
+ALO_ORDER_TYPE: Final[str] = "ALO_LIMIT"
+ALO_ROUTING_TAG: Final[str] = "ALO_POST_ONLY"
+
+
+class ALOOrderConstraint(BaseModel):
+    """Add-Liquidity-Only (ALO) Post-Only Maker order constraints."""
+
+    model_config = ConfigDict(frozen=True)
+
+    is_alo: bool = True
+    order_type: Literal["ALO_LIMIT"] = "ALO_LIMIT"
+    routing_tag: str = "ALO_POST_ONLY"
+    maker_fee_bps: float = 1.5
+    taker_fee_bps: float = 4.5
+    allow_taker_execution: bool = False
+
+    @staticmethod
+    def validate_passive_price(
+        side: Literal["BUY", "SELL"], price: float, best_bid: float, best_ask: float
+    ) -> bool:
+        """Enforce that order strictly rests passively on the book and does not cross spread."""
+        if side == "BUY":
+            return price <= best_bid
+        return price >= best_ask
+
+    @staticmethod
+    def verify_no_taker_fill(
+        side: Literal["BUY", "SELL"], fill_price: float, best_bid: float, best_ask: float
+    ) -> bool:
+        """Reject any fill that would execute as taker."""
+        if side == "BUY" and fill_price >= best_ask:
+            return False
+        if side == "SELL" and fill_price <= best_bid:
+            return False
+        return True
+
 
 if TYPE_CHECKING:
 
@@ -367,7 +405,7 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
                 time_in_force="NONE",
                 consecutive_rejections=self._consecutive_rejections.get(instrument_id, 0),
                 reason=(
-                    f"Toxic Sweep Shield triggered (VPIN={eff_vpin:.4f} > {self._config.vpin_toxic_threshold:.2f} "
+                    f"TOXIC_SWEEP_SHIELD triggered (VPIN={eff_vpin:.4f} > {self._config.vpin_toxic_threshold:.2f} "
                     f"or eta_Hawkes={eff_eta:.4f} > {self._config.hawkes_eta_toxic_threshold:.2f}): "
                     "cancelling all resting entry limit orders."
                 ),
@@ -573,12 +611,222 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
             time_in_force="NONE",
             consecutive_rejections=self._consecutive_rejections.get(instrument_id, 0),
             reason=(
-                f"Toxic Sweep Shield invoked (VPIN={vpin:.4f}, eta_Hawkes={hawkes_eta:.4f}): "
+                f"TOXIC_SWEEP_SHIELD invoked (VPIN={vpin:.4f}, eta_Hawkes={hawkes_eta:.4f}): "
                 "all resting entry orders cancelled."
             ),
+        )
+
+    def evaluate_order_action(
+        self,
+        instrument_id: str,
+        desired_side: Literal["BUY", "SELL"],
+        current_mid: float,
+        best_bid: float,
+        best_ask: float,
+        resting_order_price: float | None = None,
+        resting_order_side: Literal["BUY", "SELL"] | None = None,
+        vpin: float = 0.0,
+        hawkes_eta: float = 0.0,
+        consecutive_rejections: int = 0,
+        quantity: float = 1.0,
+        tick_size: float = 0.01,
+        hard_stop_breached: bool = False,
+        circuit_breaker_active: bool = False,
+        ts_ns: int | None = None,
+        is_alo: bool = True,
+    ) -> ExecutionOrderCommand:
+        """Evaluate order action with explicit Add-Liquidity-Only (ALO) constraints and routing."""
+        now_ns = ts_ns if ts_ns is not None else time.time_ns()
+
+        # 1. Hard stop-loss or emergency circuit-breaker exit
+        if hard_stop_breached or circuit_breaker_active:
+            return self.evaluate_order_intent(
+                instrument_id=instrument_id,
+                ts_ns=now_ns,
+                side=desired_side,
+                quantity=quantity,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                tick_size=tick_size,
+                hard_stop_breached=hard_stop_breached,
+                circuit_breaker_active=circuit_breaker_active,
+            )
+
+        # 2. Toxic Sweep Shield (VPIN > 0.60 or eta_Hawkes > 0.70)
+        if self.is_toxic_regime(vpin=vpin, hawkes_eta=hawkes_eta):
+            self._resting_orders.pop(instrument_id, None)
+            return ExecutionOrderCommand(
+                instrument_id=instrument_id,
+                ts_ns=now_ns,
+                action=ExecutionAction.CANCEL_ALL_TOXIC_SHIELD,
+                side="NONE",
+                target_price=0.0,
+                quantity=0.0,
+                post_only_gtx=False,
+                time_in_force="NONE",
+                consecutive_rejections=consecutive_rejections or self._consecutive_rejections.get(instrument_id, 0),
+                reason=(
+                    f"TOXIC_SWEEP_SHIELD triggered (VPIN={vpin:.4f} > {self._config.vpin_toxic_threshold:.2f} "
+                    f"or eta_Hawkes={hawkes_eta:.4f} > {self._config.hawkes_eta_toxic_threshold:.2f}): "
+                    "cancelling all resting entry limit orders."
+                ),
+            )
+
+        # 3. 3-Strike GTX Rejection Backoff (consecutive_rejections >= 3)
+        eff_rejections = consecutive_rejections if consecutive_rejections > 0 else self._consecutive_rejections.get(instrument_id, 0)
+        if eff_rejections >= self._config.max_gtx_rejections:
+            deeper_price = (
+                max(tick_size, best_bid - tick_size)
+                if desired_side == "BUY"
+                else (best_ask + tick_size)
+            )
+            cooldown_until = now_ns + self._rejection_backoff_ns
+            self._backoff_cooldown_until_ns[instrument_id] = cooldown_until
+            self._resting_orders[instrument_id] = RestingMakerOrderState(
+                instrument_id=instrument_id,
+                side=desired_side,
+                resting_price=float(deeper_price),
+                quantity=float(quantity),
+                last_mod_ts_ns=now_ns,
+                cooldown_until_ts_ns=cooldown_until,
+                is_entry=True,
+            )
+            return ExecutionOrderCommand(
+                instrument_id=instrument_id,
+                ts_ns=now_ns,
+                action=ExecutionAction.BACKOFF_DEEPER_GTX,
+                side=desired_side,
+                target_price=float(deeper_price),
+                quantity=float(quantity),
+                post_only_gtx=True,
+                time_in_force="GTX",
+                consecutive_rejections=eff_rejections,
+                reason=(
+                    f"GTX rejected {eff_rejections} consecutive times: "
+                    f"placing deeper passive ALO maker at {deeper_price:.6f}."
+                ),
+            )
+
+        # 4. ALO Post-Only Maker Constraints:
+        # Check if resting order is crossing the spread
+        is_crossed = False
+        if resting_order_price is not None:
+            if desired_side == "BUY" and resting_order_price >= best_ask:
+                is_crossed = True
+            elif desired_side == "SELL" and resting_order_price <= best_bid:
+                is_crossed = True
+
+        if is_crossed:
+            # Cannot hold crossed order in ALO. Must place or amend passive post-only maker at best BBO
+            passive_price = best_bid if desired_side == "BUY" else best_ask
+            self._resting_orders[instrument_id] = RestingMakerOrderState(
+                instrument_id=instrument_id,
+                side=desired_side,
+                resting_price=float(passive_price),
+                quantity=float(quantity),
+                last_mod_ts_ns=now_ns,
+                cooldown_until_ts_ns=now_ns + self._repeg_cooldown_ns,
+                is_entry=True,
+            )
+            return ExecutionOrderCommand(
+                instrument_id=instrument_id,
+                ts_ns=now_ns,
+                action=ExecutionAction.PLACE_GTX_MAKER,
+                side=desired_side,
+                target_price=float(passive_price),
+                quantity=float(quantity),
+                post_only_gtx=True,
+                time_in_force="GTX",
+                consecutive_rejections=0,
+                reason=(
+                    f"ALO Post-Only constraint: crossed resting price {resting_order_price:.2f} clamped "
+                    f"to passive BBO {passive_price:.2f} to guarantee maker fee."
+                ),
+            )
+
+        # If resting order exists and is not crossed, evaluate hysteresis:
+        if resting_order_price is not None:
+            target_bbo = best_bid if desired_side == "BUY" else best_ask
+            shift_ratio = abs(target_bbo - resting_order_price) / max(resting_order_price, 1e-9)
+            tracked = self._resting_orders.get(instrument_id)
+            elapsed_ns = (
+                (now_ns - tracked.last_mod_ts_ns)
+                if (tracked is not None and tracked.side == desired_side)
+                else self._repeg_cooldown_ns + 1
+            )
+            if shift_ratio >= (self._repeg_min_ratio - _FLOAT_TOL) and elapsed_ns >= self._repeg_cooldown_ns:
+                self._resting_orders[instrument_id] = RestingMakerOrderState(
+                    instrument_id=instrument_id,
+                    side=desired_side,
+                    resting_price=float(target_bbo),
+                    quantity=float(quantity),
+                    last_mod_ts_ns=now_ns,
+                    cooldown_until_ts_ns=now_ns + self._repeg_cooldown_ns,
+                    is_entry=True,
+                )
+                return ExecutionOrderCommand(
+                    instrument_id=instrument_id,
+                    ts_ns=now_ns,
+                    action=ExecutionAction.AMEND_GTX_MAKER,
+                    side=desired_side,
+                    target_price=float(target_bbo),
+                    quantity=float(quantity),
+                    post_only_gtx=True,
+                    time_in_force="GTX",
+                    consecutive_rejections=0,
+                    reason=f"ALO maker re-peg hysteresis satisfied: amending to {target_bbo:.6f}.",
+                )
+            else:
+                return ExecutionOrderCommand(
+                    instrument_id=instrument_id,
+                    ts_ns=now_ns,
+                    action=ExecutionAction.HOLD_RESTING_HYSTERESIS,
+                    side=desired_side,
+                    target_price=float(resting_order_price),
+                    quantity=float(quantity),
+                    post_only_gtx=True,
+                    time_in_force="GTX",
+                    consecutive_rejections=0,
+                    reason=f"ALO maker holding resting order at {resting_order_price:.6f}.",
+                )
+
+        # 5. Initial normal placement at passive BBO
+        target_price = best_bid if desired_side == "BUY" else best_ask
+        self._resting_orders[instrument_id] = RestingMakerOrderState(
+            instrument_id=instrument_id,
+            side=desired_side,
+            resting_price=float(target_price),
+            quantity=float(quantity),
+            last_mod_ts_ns=now_ns,
+            cooldown_until_ts_ns=now_ns + self._repeg_cooldown_ns,
+            is_entry=True,
+        )
+        return ExecutionOrderCommand(
+            instrument_id=instrument_id,
+            ts_ns=now_ns,
+            action=ExecutionAction.PLACE_GTX_MAKER,
+            side=desired_side,
+            target_price=float(target_price),
+            quantity=float(quantity),
+            post_only_gtx=True,
+            time_in_force="GTX",
+            consecutive_rejections=0,
+            reason=f"ALO Post-Only maker order placed at passive BBO {target_price:.6f}.",
         )
 
     def shutdown(self) -> None:
         """Shut down all background Hawkes MLE refit executors."""
         for mon in self._hawkes_monitors.values():
             mon.shutdown()
+
+
+__all__ = [
+    "ALOOrderConstraint",
+    "ALO_ORDER_TYPE",
+    "ALO_ROUTING_TAG",
+    "DefensiveMakerConfig",
+    "DefensiveMakerExecutionAlgorithm",
+    "RecursiveHawkesMonitor",
+    "RestingMakerOrderState",
+    "RollingBVCVPINMonitor",
+]
