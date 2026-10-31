@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nautilus-quant-m1max"
+version = "4.0.0"
+description = "Institutional Medium-Frequency Crypto-Derivatives & Delta-Neutral Carry Architecture for Apple M1 Max (64GB)"
+readme = "ARCHITECTURE_STATE.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7.0",
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+    "polars>=0.20.0",
+    "numba>=0.59.0",
+    "scikit-learn>=1.4.0",
+    "lightgbm>=4.3.0",
+    "xgboost>=2.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "hypothesis>=6.100.0",
+    "mypy>=1.9.0",
+]
+live = [
+    "nautilus_trader>=1.190.0",
+    "mlx>=0.12.0",
+    "mlx-lm>=0.12.0",
+    "redis>=5.0.0",
+    "pyarrow>=15.0.0",
+    "plotly>=5.20.0",
+    "streamlit>=1.33.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "sleeves", "risk", "sentiment", "research", "ui"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+disallow_subclassing_any = false
+warn_return_any = true
+warn_unused_configs = false
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_no_return = true
+explicit_package_bases = true
+mypy_path = "."
+packages = ["core", "sleeves", "risk", "sentiment", "research", "ui"]
+
+[[tool.mypy.overrides]]
+module = [
+    "nautilus_trader.*",
+    "mlx.*",
+    "mlx_lm.*",
+    "lightgbm.*",
+    "xgboost.*",
+    "numba.*",
+    "scipy.*",
+    "plotly.*",
+    "streamlit.*",
+    "polars.*",
+    "pyarrow.*",
+    "redis.*",
+    "sklearn.*",
+    "statsmodels.*",
+    "fastapi.*",
+    "uvicorn.*",
+    "httpx.*",
+    "telegram.*",
+]
+ignore_missing_imports = true
+follow_imports = "silent"

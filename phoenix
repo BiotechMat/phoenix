@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PHOENIX_DIR="/Users/mbeale/project-phoenix"
+if [ ! -d "${PHOENIX_DIR}/.venv" ]; then
+    PHOENIX_DIR="/Users/mbeale/.gemini/antigravity/scratch/nautilus_quant_m1max"
+fi
+
+export DYLD_LIBRARY_PATH="/opt/homebrew/opt/libomp/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+
+CMD="${1:-rise}"
+
+case "${CMD}" in
+    rise|start|up)
+        echo "🔥 Phoenix rising at http://127.0.0.1:8080 (workspace: ${PHOENIX_DIR})..."
+        cd "${PHOENIX_DIR}"
+        ./scripts/tune_macos_kernel.sh
+        exec .venv/bin/uvicorn ui.api_server:app --host 127.0.0.1 --port 8080
+        ;;
+    test)
+        cd "${PHOENIX_DIR}"
+        exec .venv/bin/pytest tests/test_architecture_verification.py -v
+        ;;
+    check|typecheck)
+        cd "${PHOENIX_DIR}"
+        exec .venv/bin/mypy core sleeves risk sentiment research ui tests
+        ;;
+    verify|all)
+        cd "${PHOENIX_DIR}"
+        exec ./run.sh
+        ;;
+    *)
+        echo "Usage: phoenix {rise|test|check|verify}"
+        exit 1
+        ;;
+esac

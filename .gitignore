@@ -1,0 +1,20 @@
+# Virtual environments & caches
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# macOS & IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Legacy subdirectory
+quant-engine/
