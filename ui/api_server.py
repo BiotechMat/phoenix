@@ -206,8 +206,8 @@ class ControlCenterStateStore:
         """Fit a real Stage-1 SVD + Mahalanobis Gate + Stage-2 Calibrated LightGBM model on warm-up bars."""
         rng = np.random.default_rng(42)
         warmup_bars: list[DollarBar] = []
-        px = 68_000.0
-        oi = 82_000.0
+        px = float(self._state.dollar_bars[-1].close)
+        oi = 84_500.0
         base_ts = 1_730_000_000_000_000_000
         step_ns = 900_000_000_000
         for i in range(80):
