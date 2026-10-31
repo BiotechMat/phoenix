@@ -21,3 +21,6 @@ build/
 
 # Legacy subdirectory
 quant-engine/
+
+# Replay reports
+data/replays/

@@ -101,7 +101,7 @@ Implemented on branch `claude/intelligent-sagan-q8qknt`. Acceptance tests live i
 Consequences worth knowing:
 
 - One tick now processes one closed 15-minute candle. A tick between candle closes returns `waiting_for_bar` and changes nothing; the dashboard poller runs every 10 seconds.
-- Hyperliquid has no public open-interest history, so seeded bars carry the current OI and are not written to the training store. The meta-labeller therefore has no model until roughly 500 live bars with real OI have been recorded (about five days), and the dashboard says so. P1.2 (Bybit OI history backfill) removes this wait.
+- Hyperliquid has no public open-interest history, so seeded bars carry the current OI and are not written to the training store. The meta-labeller therefore has no model until roughly 500 live bars with real OI have been recorded (about five days), and the dashboard says so. Running `scripts/backfill.py` (P1.2, done) fills the training store with real open interest and removes this wait.
 - Reported equity is base capital plus realised PnL; unrealised PnL of open positions is reported separately (`unrealized_pnl_usd`, `marked_equity_usd`).
 - The cross-venue funding spread has no second-venue feed yet and is reported as `null`.
 - Paper PnL will look worse than before. The previous numbers measured a forced trade every bar with a probability floor, not a strategy.
@@ -161,6 +161,16 @@ Existing tests changed: `test_account_ledger_restart_durability` and `test_trade
 - Effort: M. Depends on: P1.6.
 
 **Phase 1 gate**: backfill covers 12 months; all four replay scenarios run; the trial registry is non-empty; the availability record shows trades, candles, funding, OI and lead mids live.
+
+### Phase 1 implementation status (2026-10-31)
+
+| Task | Status | Where |
+|------|--------|-------|
+| P1.2 | Done for candles, mark/index prices, funding and open interest. `scripts/backfill.py` writes one Parquet per asset per horizon (`data/{coin}usdt_perp_bars.parquet` for 15m, which is also the live training store, and `..._1h.parquet`) with the 18-column schema plus `funding_rate_1h`, `taker_buy_volume` (null until P1.1), `bar_source`, `oi_source` and `fields_unavailable`. Candles and mark/index prices come from Bybit (primary) or OKX (years of history on both); funding from Hyperliquid `fundingHistory` (multi-year); open interest from Bybit (multi-year) or OKX (recent weeks only). Rows without open interest carry `null` and are excluded from training. Coverage and gap checks are asserted by `tests/test_backfill.py`; the CLI exits non-zero on any gap longer than two bars. Not yet backfilled: liquidation volume (P1.3), taker buy volume (P1.1), and the Hyperliquid L2 archive for 10 Oct 2025. | `data/backfill_storage.py`, `scripts/backfill.py` |
+| P1.7 | Done. `research/replay.py` drives `step_simulation_tick` through `ScriptedBarFeed` on Parquet bars with no network, pluggable sleeves, causal model training (only rows closing before the scenario start reach the training store), and a JSON report with per-trade records, equity curve, turnover, fees, funding, drawdown and per-sleeve attribution. Markouts are reported unavailable until P4.2. The four named scenarios are registered; they need the 2024 to 2025 windows backfilled first (`scripts/backfill.py --start 2024-07-01`). A 19-bar scripted scenario replays in well under a second; two days of real bars with model training replays in seconds. | `research/replay.py`, `tests/test_replay.py` |
+| P1.1, P1.3, P1.4, P1.5, P1.6, P1.8 | Not started. | |
+
+Sandbox note: the Bybit paths are exercised on recorded fixtures only, because Bybit and Binance refuse requests from the development sandbox; OKX and Hyperliquid were verified live. On a machine with Bybit access, `--venues bybit,okx` (the default) prefers Bybit for candles and multi-year open interest.
 
 ---
 

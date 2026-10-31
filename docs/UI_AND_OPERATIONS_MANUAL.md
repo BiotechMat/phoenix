@@ -124,3 +124,9 @@ Never rush directly into live capital. Follow this 5-step graduation protocol:
 - **Trades are positions, not bars.** A position opens when a sleeve has a real signal, and closes at its profit barrier, its stop barrier, after 16 bars, on a risk-committee veto, or when the signal flips. Wins and losses are counted only when a position closes. "Equity" is starting capital plus realised profit; open positions show separately as unrealised PnL.
 - **Nothing is invented.** Inputs without a live feed (taker buy/sell split, liquidations, open-interest history, a second funding venue) are shown as unavailable. The AI win-probability model trains only once about five days of real bars have been recorded; until then the meta sleeve stays flat and the panel says "no model".
 - **The sleeve panel is live.** Funding carry APR, breakeven hours, actionability, Deribit skew, dealer GEX and HLP crowding come from the sleeves' latest real evaluations on every bar.
+
+
+## Backfilling history and replaying a window
+
+- **Backfill**: `.venv/bin/python scripts/backfill.py --months 12` fills `data/*usdt_perp_bars.parquet` (15m) and `data/*usdt_perp_bars_1h.parquet` with real candles, mark and index prices, Hyperliquid funding and open interest for BTC, ETH and SOL. Bybit is preferred; OKX is the fallback. The table it prints shows rows, gaps and which venue supplied what. Once the 15m store has about five hundred bars with open interest, the AI win-probability model trains at the next start.
+- **Replay**: `.venv/bin/python -m research.replay --scenario calm_2025_09` (or `--start`/`--end` for any window) runs the same engine as the dashboard over stored bars, with no network, and writes a JSON report to `data/replays/` with every trade, the equity curve, fees, funding and per-sleeve results.

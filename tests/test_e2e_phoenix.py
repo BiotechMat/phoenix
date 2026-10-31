@@ -656,7 +656,7 @@ class TestTier1FeatureCoverage:
             assert df.height > 0
             for col in BASE_COLUMNS:
                 assert col in df.columns, f"Missing column {col} in {parquet_path}"
-            assert len(df.columns) in (18, 19)
+            assert len(df.columns) >= 18  # base schema plus funding_rate_1h and provenance columns
 
     def test_r4_f17_cpcv_45_split_combinatorial_purging_and_embargo(self) -> None:
         """R4.2: Verify 45-split CPCV generates 45 unique splits with zero label leakage."""
