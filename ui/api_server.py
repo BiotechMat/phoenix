@@ -516,7 +516,11 @@ def create_app(store: ControlCenterStateStore | None = None) -> FastAPI:
     def get_dashboard_root() -> HTMLResponse:
         """Render the complete 3-tab interactive HTML Control Center."""
         html_doc = render_full_dashboard_html(state_store.state)
-        return HTMLResponse(content=html_doc, status_code=200)
+        return HTMLResponse(
+            content=html_doc,
+            status_code=200,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
 
     @app.get("/api/state")
     def get_live_state() -> dict[str, Any]:

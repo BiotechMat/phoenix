@@ -10,16 +10,24 @@ LOG_FILE="${PHOENIX_DIR}/logs/phoenix.log"
 mkdir -p "${PHOENIX_DIR}/logs"
 
 export DYLD_LIBRARY_PATH="/opt/homebrew/opt/libomp/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+export PYTHONPATH="${PHOENIX_DIR}"
 
 CMD="${1:-rise}"
 
 case "${CMD}" in
-    rise|start|up)
+    rise|start|up|restart)
+        echo "🔄 Stopping any stale Phoenix server on port 8080..."
+        pkill -f "uvicorn ui.api_server:app" 2>/dev/null || true
+        sleep 0.4
         echo "🔥 Phoenix rising at http://127.0.0.1:8080 (workspace: ${PHOENIX_DIR})..."
         echo "📄 Live engine logs streaming to: ${LOG_FILE} (run 'phoenix logs' in another tab to watch)"
         cd "${PHOENIX_DIR}"
         ./scripts/tune_macos_kernel.sh
-        exec .venv/bin/uvicorn ui.api_server:app --host 127.0.0.1 --port 8080 --log-level info
+        exec .venv/bin/python -m uvicorn ui.api_server:app --host 127.0.0.1 --port 8080 --log-level info
+        ;;
+    stop|down)
+        pkill -f "uvicorn ui.api_server:app" 2>/dev/null || true
+        echo "🛑 Stopped Phoenix server."
         ;;
     logs|log|watch)
         touch "${LOG_FILE}"
@@ -47,18 +55,18 @@ except Exception as e:
         ;;
     test)
         cd "${PHOENIX_DIR}"
-        exec .venv/bin/pytest tests/test_architecture_verification.py -v
+        exec .venv/bin/python -m pytest tests/test_architecture_verification.py -v
         ;;
     check|typecheck)
         cd "${PHOENIX_DIR}"
-        exec .venv/bin/mypy core sleeves risk sentiment research ui tests
+        exec .venv/bin/python -m mypy core sleeves risk sentiment research ui tests
         ;;
     verify|all)
         cd "${PHOENIX_DIR}"
         exec ./run.sh
         ;;
     *)
-        echo "Usage: phoenix {rise|logs|status|test|check|verify}"
+        echo "Usage: phoenix {rise|restart|stop|logs|status|test|check|verify}"
         exit 1
         ;;
 esac
