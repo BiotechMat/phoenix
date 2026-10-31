@@ -1,5 +1,6 @@
 # Virtual environments & caches
 .venv/
+logs/
 __pycache__/
 *.py[cod]
 *$py.class

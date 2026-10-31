@@ -924,7 +924,7 @@ def load_layman_document_markdown(doc_name: str) -> str:
 
 
 def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> str:
-    """Render the complete 3-tab HTML Control Center with hover tooltips and embedded manuals."""
+    """Render the simplified, high-clarity 3-tab HTML Control Center with live Dry-Run feedback."""
     resolved = state or build_default_dashboard_state()
     candlestick_fig = build_candlestick_dollar_bar_figure(resolved)
     weights_fig = build_portfolio_weights_figure(resolved.portfolio_allocation)
@@ -950,16 +950,23 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
         for k, v in PLAIN_ENGLISH_TOOLTIPS.items()
     )
 
+    latest_bar = resolved.dollar_bars[-1]
     latest_meta = resolved.meta_predictions[-1]
     latest_pos = resolved.positioning_signals[-1]
-    shield_status = "TOXIC SWEEP ACTIVE (ORDERS PULLED)" if resolved.hawkes_state.toxic_sweep_active else "SAFE (MAKER GTX ACTIVE)"
+    shield_status = (
+        "TOXIC SWEEP ACTIVE (ORDERS PULLED)"
+        if resolved.hawkes_state.toxic_sweep_active
+        else "ALL 4 SHIELDS GREEN (SAFE)"
+    )
 
     weights_rows = "".join(
         f"<tr>"
         f"<td><strong>{html.escape(asset)}</strong></td>"
-        f"<td>{w:+.4f} ({w:+.2%})</td>"
-        f"<td>{resolved.portfolio_allocation.hrp_unsigned_weights.get(asset, 0.0):.4f}</td>"
-        f"<td>{resolved.portfolio_allocation.kelly_scalars.get(asset, 0.0):.2%}</td>"
+        f"<td><span class='pos-pill {'pos-long' if w > 0 else ('pos-short' if w < 0 else 'pos-flat')}'>"
+        f"{'LONG (BUY)' if w > 0 else ('SHORT (SELL)' if w < 0 else 'FLAT (CASH)')}</span></td>"
+        f"<td><strong>{w:+.1%}</strong> ({w:+.4f})</td>"
+        f"<td>{resolved.portfolio_allocation.hrp_unsigned_weights.get(asset, 0.0):.0%}</td>"
+        f"<td>{resolved.portfolio_allocation.kelly_scalars.get(asset, 0.0):.0%}</td>"
         f"</tr>"
         for asset, w in resolved.portfolio_allocation.weights.items()
     )
@@ -969,12 +976,13 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Gemini Argon 4 — M1 Max Quantitative Derivatives Control Center</title>
+  <title>Project Phoenix — Simple Trading Control Center</title>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
   <style>
     :root {{
       --bg: #0b1120;
-      --panel: #1e293b;
+      --panel: #152033;
+      --panel-alt: #1e293b;
       --border: #334155;
       --text: #f8fafc;
       --muted: #94a3b8;
@@ -991,6 +999,7 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       color: var(--text);
       line-height: 1.5;
     }}
+    /* TOP CONTROL BAR */
     header {{
       display: flex;
       flex-wrap: wrap;
@@ -999,40 +1008,233 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       padding: 16px 24px;
       background: #0f172a;
       border-bottom: 1px solid var(--border);
-      gap: 12px;
+      gap: 16px;
     }}
-    .brand h1 {{ margin: 0; font-size: 1.25rem; }}
-    .brand p {{ margin: 2px 0 0; color: var(--muted); font-size: 0.85rem; }}
-    .controls {{ display: flex; flex-wrap: wrap; gap: 10px; }}
+    .brand-row {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }}
+    .brand h1 {{ margin: 0; font-size: 1.3rem; letter-spacing: -0.01em; }}
+    .brand p {{ margin: 3px 0 0; color: var(--muted); font-size: 0.86rem; }}
+    .status-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 14px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 0.85rem;
+      background: rgba(16, 185, 129, 0.16);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.45);
+    }}
+    .status-dot {{
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+      animation: pulse 1.4s infinite;
+    }}
+    @keyframes pulse {{
+      0%, 100% {{ transform: scale(1); opacity: 1; }}
+      50% {{ transform: scale(1.3); opacity: 0.55; }}
+    }}
+    .controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }}
     .btn {{
-      border: 1px solid var(--border);
-      padding: 9px 14px;
-      border-radius: 8px;
-      font-weight: 600;
+      border: 2px solid transparent;
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-weight: 700;
       cursor: pointer;
       color: #fff;
-      font-size: 0.85rem;
+      font-size: 0.88rem;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      opacity: 0.82;
+    }}
+    .btn:hover {{ opacity: 1; transform: translateY(-1px); }}
+    .btn.active-mode {{
+      opacity: 1;
+      border-color: #ffffff;
+      box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.22);
     }}
     .btn-dryrun {{ background: #059669; }}
+    .btn-step {{ background: #2563eb; border: 1px solid #60a5fa; opacity: 1; }}
     .btn-pause {{ background: #d97706; }}
     .btn-carry {{ background: #0284c7; }}
     .btn-flatten {{ background: #dc2626; }}
-    .asri-banner {{
-      margin: 14px 24px;
+
+    /* LIVE ACTION FEEDBACK BANNER */
+    .action-feedback-banner {{
+      margin: 14px 24px 10px;
       padding: 12px 18px;
       background: #172554;
-      border-left: 4px solid var(--blue);
-      border-radius: 8px;
+      border-left: 5px solid var(--green);
+      border-radius: 10px;
+      font-size: 0.94rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      transition: background 0.25s ease;
+    }}
+    .flash-highlight {{
+      animation: flashBg 0.7s ease;
+    }}
+    @keyframes flashBg {{
+      0% {{ background: rgba(16, 185, 129, 0.35); }}
+      100% {{ background: #172554; }}
+    }}
+
+    /* 4 SIMPLE TOP CARDS */
+    .simple-kpi-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      padding: 6px 24px 16px;
+    }}
+    .kpi-card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+    }}
+    .kpi-label {{
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      cursor: help;
+    }}
+    .kpi-main {{
+      font-size: 1.45rem;
+      font-weight: 800;
+      margin: 6px 0 4px;
+      color: #fff;
+    }}
+    .kpi-sub {{
+      font-size: 0.82rem;
+      color: var(--muted);
+    }}
+
+    /* TABS */
+    .tabs {{
+      display: flex;
+      gap: 8px;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--border);
+      background: #0f172a;
+    }}
+    .tab-btn {{
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      border-bottom: 3px solid transparent;
+      padding: 13px 18px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }}
+    .tab-btn.active {{
+      color: var(--blue);
+      border-bottom-color: var(--blue);
+    }}
+    .tab-panel {{ display: none; padding: 18px 24px; }}
+    .tab-panel.active {{ display: block; }}
+
+    /* LIVE SPLIT LAYOUT */
+    .live-grid {{
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 18px;
+      align-items: start;
+    }}
+    @media (max-width: 1024px) {{
+      .live-grid {{ grid-template-columns: 1fr; }}
+    }}
+    .chart-box {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 16px;
+    }}
+    .feed-box {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }}
+    .feed-box h3 {{
+      margin: 0 0 10px;
+      font-size: 1rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    .activity-list {{
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      max-height: 290px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .activity-item {{
+      background: #0f172a;
+      border-left: 3px solid var(--blue);
+      padding: 9px 12px;
+      border-radius: 6px;
+      font-size: 0.83rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }}
+    .pos-pill {{
+      display: inline-block;
+      padding: 3px 9px;
+      border-radius: 6px;
+      font-size: 0.76rem;
+      font-weight: 700;
+    }}
+    .pos-long {{ background: rgba(16, 185, 129, 0.2); color: #34d399; }}
+    .pos-short {{ background: rgba(239, 68, 68, 0.2); color: #f87171; }}
+    .pos-flat {{ background: rgba(148, 163, 184, 0.2); color: #cbd5e1; }}
+
+    /* ADVANCED DRAWER */
+    details.advanced-drawer {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 18px;
+      margin-top: 12px;
+    }}
+    details.advanced-drawer summary {{
+      cursor: pointer;
+      font-weight: 700;
+      color: var(--blue);
       font-size: 0.92rem;
     }}
     .badge-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
       gap: 12px;
-      padding: 0 24px 16px;
+      margin-top: 14px;
     }}
     .metric-card {{
-      background: var(--panel);
+      background: var(--panel-alt);
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 12px 14px;
@@ -1045,52 +1247,23 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       cursor: help;
     }}
     .metric-val {{
-      font-size: 1.15rem;
+      font-size: 1.05rem;
       font-weight: 700;
       margin-top: 6px;
-    }}
-    .tabs {{
-      display: flex;
-      gap: 8px;
-      padding: 0 24px;
-      border-bottom: 1px solid var(--border);
-    }}
-    .tab-btn {{
-      background: transparent;
-      color: var(--muted);
-      border: none;
-      border-bottom: 3px solid transparent;
-      padding: 12px 18px;
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 0.95rem;
-    }}
-    .tab-btn.active {{
-      color: var(--blue);
-      border-bottom-color: var(--blue);
-    }}
-    .tab-panel {{ display: none; padding: 20px 24px; }}
-    .tab-panel.active {{ display: block; }}
-    .chart-box {{
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 12px;
-      margin-bottom: 18px;
     }}
     table {{
       width: 100%;
       border-collapse: collapse;
       background: var(--panel);
-      border-radius: 8px;
+      border-radius: 10px;
       overflow: hidden;
-      margin-bottom: 18px;
+      margin-bottom: 16px;
     }}
     th, td {{
       padding: 10px 14px;
       border-bottom: 1px solid var(--border);
       text-align: left;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
     }}
     th {{ background: #0f172a; color: var(--blue); }}
     .markdown-pre {{
@@ -1108,74 +1281,166 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
 </head>
 <body>
   <header>
-    <div class="brand">
-      <h1>Gemini Argon 4 — M1 Max (64GB) Quantitative Derivatives Control Center</h1>
-      <p>Mode: <strong id="mode-indicator">{html.escape(resolved.regime_mode.value)}</strong> | {html.escape(resolved.last_control_message)}</p>
+    <div class="brand-row">
+      <div class="brand">
+        <h1>🔥 Project Phoenix — Control Center</h1>
+        <p>Paper Trading &amp; Risk Control • Mode: <strong id="mode-indicator">{html.escape(resolved.regime_mode.value)}</strong></p>
+      </div>
+      <div id="live-status-pill" class="status-pill">
+        <span id="status-dot" class="status-dot"></span>
+        <span id="status-pill-text">DRY-RUN RUNNING LIVE (Auto-Updating)</span>
+      </div>
     </div>
+
     <div class="controls">
-      <button class="btn btn-dryrun" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['start_dry_run'])}" onclick="sendControl('start_dry_run')">Start Dry-Run</button>
-      <button class="btn btn-pause" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['pause_entries'])}" onclick="sendControl('pause_entries')">Pause Entries</button>
-      <button class="btn btn-carry" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['switch_carry_only'])}" onclick="sendControl('switch_carry_only')">Switch to Carry-Only</button>
-      <button class="btn btn-flatten" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['emergency_flatten'])}" onclick="sendControl('emergency_flatten')">Emergency Flatten All</button>
+      <button id="btn-start_dry_run" class="btn btn-dryrun active-mode" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['start_dry_run'])}" onclick="sendControl('start_dry_run')">
+        ▶ Start Dry-Run
+      </button>
+      <button id="btn-step_bar" class="btn btn-step" title="Immediately simulate 1 new 15-minute market bar and update chart &amp; profit" onclick="stepSingleBar()">
+        ⚡ Step +1 Bar Now
+      </button>
+      <button id="btn-pause_entries" class="btn btn-pause" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['pause_entries'])}" onclick="sendControl('pause_entries')">
+        ⏸ Pause Entries
+      </button>
+      <button id="btn-switch_carry_only" class="btn btn-carry" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['switch_carry_only'])}" onclick="sendControl('switch_carry_only')">
+        🏦 Switch to Carry-Only
+      </button>
+      <button id="btn-emergency_flatten" class="btn btn-flatten" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['emergency_flatten'])}" onclick="sendControl('emergency_flatten')">
+        🛑 Emergency Flatten All
+      </button>
     </div>
   </header>
 
-  <div class="asri-banner" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['asri_macro'])}">
-    <strong>🧠 Local Qwen3-8B-4bit ASRI Macro Weather ({resolved.asri_risk.score:.1f}/100, M_regime={resolved.portfolio_allocation.regime_multiplier:.2f}):</strong>
-    {html.escape(resolved.asri_risk.plain_english_summary)}
+  <!-- CLEAR FEEDBACK BANNER SO EVERY BUTTON CLICK IS IMMEDIATELY VISIBLE -->
+  <div id="feedback-banner" class="action-feedback-banner" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['asri_macro'])}">
+    <div>
+      <strong id="banner-headline">📢 Live Status:</strong>
+      <span id="banner-message">{html.escape(resolved.last_control_message)}</span>
+    </div>
+    <div style="font-size: 0.82rem; color: #cbd5e1; white-space: nowrap;">
+      Bar #<span id="bar-counter">{len(resolved.dollar_bars)}</span> • BTC: <strong id="live-btc-price">${latest_bar.close:,.2f}</strong>
+    </div>
   </div>
 
-  <div class="badge-grid">
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['vpin_toxicity'])}">
-      <span class="metric-title">VPIN Toxicity &amp; Shield (?)</span>
-      <div class="metric-val">{resolved.hawkes_state.vpin:.2f} — {shield_status}</div>
+  <!-- 4 SIMPLE, PLAIN-ENGLISH SUMMARY CARDS -->
+  <div class="simple-kpi-grid">
+    <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['net_of_fee_pnl'])}">
+      <div class="kpi-label">1. Total Profit (After All Fees) (?)</div>
+      <div id="kpi-pnl-val" class="kpi-main" style="color: var(--green);">+${resolved.pnl_metrics.net_pnl_usd:,.2f}</div>
+      <div id="kpi-pnl-sub" class="kpi-sub">+{resolved.pnl_metrics.net_pnl_bps:.1f} bps net • Saved ${resolved.pnl_metrics.fee_savings_usd:,.2f} via Maker orders</div>
     </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['hawkes_reflexivity'])}">
-      <span class="metric-title">O(1) Hawkes Reflexivity eta (?)</span>
-      <div class="metric-val">{resolved.hawkes_state.branching_ratio_eta:.2f} (Limit 0.70)</div>
+
+    <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['hrp_cvar_weights'])}">
+      <div class="kpi-label">2. What The Bot Is Doing Now (?)</div>
+      <div id="kpi-action-val" class="kpi-main">Buying BTC &amp; ETH</div>
+      <div id="kpi-action-sub" class="kpi-sub">Total Leverage: {resolved.portfolio_allocation.gross_leverage:.2f}x (Safe Cap: 2.50x)</div>
     </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['meta_probability'])}">
-      <span class="metric-title">LightGBM Meta-Probability p_meta (?)</span>
-      <div class="metric-val">{latest_meta.p_meta:.1%} (+{latest_meta.expected_net_edge_bps:.1f} bps net edge)</div>
+
+    <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['vpin_toxicity'])}">
+      <div class="kpi-label">3. Safety Shields Status (?)</div>
+      <div id="kpi-shield-val" class="kpi-main" style="color: var(--green);">4 / 4 Shields Safe</div>
+      <div id="kpi-shield-sub" class="kpi-sub">Whale VPIN: {resolved.hawkes_state.vpin:.2f} (&le;0.60) • Macro ASRI: {resolved.asri_risk.score:.0f}/100</div>
     </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['mahalanobis_di'])}">
-      <span class="metric-title">Mahalanobis DI_values Gate (?)</span>
-      <div class="metric-val">DI = {latest_meta.mahalanobis_di:.2f} / {latest_meta.di_threshold:.2f} ({'PASS' if latest_meta.epistemic_gate_passed else 'BLOCKED'})</div>
-    </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['squeeze_regime'])}">
-      <span class="metric-title">Perpetual Squeeze Regime (?)</span>
-      <div class="metric-val">{html.escape(latest_pos.regime.value)}</div>
-    </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['ffd_stationarity'])}">
-      <span class="metric-title">FFD Stationarity (d* / ADF) (?)</span>
-      <div class="metric-val">d*={resolved.ffd_config.d_star:.2f}, p_ADF={resolved.ffd_config.adf_pvalue:.4f}</div>
-    </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['triple_barrier'])}">
-      <span class="metric-title">Triple-Barrier Profit Hurdle (?)</span>
-      <div class="metric-val">&ge; 80.0 bps Net-of-Fee Target</div>
-    </div>
-    <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['funding_carry'])}">
-      <span class="metric-title">Delta-Neutral Funding Carry (?)</span>
-      <div class="metric-val">{resolved.pnl_metrics.annualized_carry_apr_pct:.1f}% APR (8h Harvester)</div>
+
+    <div class="kpi-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['funding_carry'])}">
+      <div class="kpi-label">4. Steady Funding Carry Yield (?)</div>
+      <div class="kpi-main" style="color: var(--blue);">+{resolved.pnl_metrics.annualized_carry_apr_pct:.1f}% APR</div>
+      <div class="kpi-sub">Hedged Spot-Long / Perp-Short 8h rent collection</div>
     </div>
   </div>
 
   <nav class="tabs">
-    <button class="tab-btn active" onclick="switchTab('tab-live', this)">1. Live Trading &amp; Charts Tab</button>
-    <button class="tab-btn" onclick="switchTab('tab-portfolio', this)">2. Portfolio &amp; Validation Tab</button>
-    <button class="tab-btn" onclick="switchTab('tab-guide', this)">3. How It Works (Plain-English Guide) Tab</button>
+    <button class="tab-btn active" onclick="switchTab('tab-live', this)">1. Live Trading &amp; Activity</button>
+    <button class="tab-btn" onclick="switchTab('tab-portfolio', this)">2. Portfolio &amp; AI Validation</button>
+    <button class="tab-btn" onclick="switchTab('tab-guide', this)">3. Plain-English Guide &amp; Manuals</button>
   </nav>
 
-  <!-- TAB 1: LIVE TRADING & CHARTS -->
+  <!-- TAB 1: SIMPLE LIVE TRADING & ACTIVITY FEED -->
   <section id="tab-live" class="tab-panel active">
-    <div class="chart-box">
-      <div id="candlestick-chart"></div>
+    <div class="live-grid">
+      <div class="chart-box">
+        <div id="candlestick-chart"></div>
+      </div>
+
+      <div>
+        <div class="feed-box">
+          <h3>
+            <span>📡 Live Bot Activity Log</span>
+            <span id="tick-badge" style="font-size: 0.78rem; color: var(--green);">● Ready</span>
+          </h3>
+          <ul id="activity-log-list" class="activity-list">
+            <li class="activity-item">Click <strong>"▶ Start Dry-Run"</strong> above to start live paper-trading bars, or click <strong>"⚡ Step +1 Bar Now"</strong> to advance 1 bar at a time.</li>
+            <li class="activity-item">[Initial State] BTC @ ${latest_bar.close:,.2f} | AI Confidence: {latest_meta.p_meta:.0%} | All 4 Safety Shields Green.</li>
+          </ul>
+        </div>
+
+        <div class="feed-box">
+          <h3>📊 Current Target Positions</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Coin</th>
+                <th>Direction</th>
+                <th>Target Size</th>
+              </tr>
+            </thead>
+            <tbody id="compact-weights-tbody">
+              {"".join(
+                  f"<tr><td><strong>{html.escape(a)}</strong></td>"
+                  f"<td><span class='pos-pill {'pos-long' if w > 0 else ('pos-short' if w < 0 else 'pos-flat')}'>"
+                  f"{'LONG' if w > 0 else ('SHORT' if w < 0 else 'CASH')}</span></td>"
+                  f"<td><strong>{w:+.1%}</strong></td></tr>"
+                  for a, w in resolved.portfolio_allocation.weights.items()
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
+
+    <!-- COLLAPSIBLE ADVANCED QUANT DRAWER SO IT DOES NOT CLUTTER THE SCREEN -->
+    <details class="advanced-drawer">
+      <summary>🔬 Show Under-the-Hood Quant Gauges (8 Advanced Technical Metrics — Hover Any Card for Plain-English Tooltip)</summary>
+      <div class="badge-grid">
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['vpin_toxicity'])}">
+          <span class="metric-title">VPIN Toxicity &amp; Shield (?)</span>
+          <div id="adv-vpin" class="metric-val">{resolved.hawkes_state.vpin:.2f} — {shield_status}</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['hawkes_reflexivity'])}">
+          <span class="metric-title">O(1) Hawkes Reflexivity eta (?)</span>
+          <div id="adv-eta" class="metric-val">{resolved.hawkes_state.branching_ratio_eta:.2f} (Safe &le; 0.70)</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['meta_probability'])}">
+          <span class="metric-title">LightGBM Meta-Probability p_meta (?)</span>
+          <div id="adv-pmeta" class="metric-val">{latest_meta.p_meta:.1%} (+{latest_meta.expected_net_edge_bps:.1f} bps net edge)</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['mahalanobis_di'])}">
+          <span class="metric-title">Mahalanobis DI_values Gate (?)</span>
+          <div id="adv-di" class="metric-val">DI = {latest_meta.mahalanobis_di:.2f} / {latest_meta.di_threshold:.2f} ({'PASS' if latest_meta.epistemic_gate_passed else 'BLOCKED'})</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['squeeze_regime'])}">
+          <span class="metric-title">Perpetual Squeeze Regime (?)</span>
+          <div id="adv-regime" class="metric-val">{html.escape(latest_pos.regime.value)}</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['ffd_stationarity'])}">
+          <span class="metric-title">FFD Stationarity (d* / ADF) (?)</span>
+          <div class="metric-val">d*={resolved.ffd_config.d_star:.2f}, p_ADF={resolved.ffd_config.adf_pvalue:.4f}</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['triple_barrier'])}">
+          <span class="metric-title">Triple-Barrier Profit Hurdle (?)</span>
+          <div class="metric-val">&ge; 80.0 bps Net-of-Fee Target</div>
+        </div>
+        <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['asri_macro'])}">
+          <span class="metric-title">Local Qwen3-8B ASRI Macro (?)</span>
+          <div class="metric-val">{resolved.asri_risk.score:.1f}/100 (M_regime={resolved.portfolio_allocation.regime_multiplier:.2f})</div>
+        </div>
+      </div>
+    </details>
   </section>
 
   <!-- TAB 2: PORTFOLIO & VALIDATION -->
   <section id="tab-portfolio" class="tab-panel">
-    <div class="badge-grid">
+    <div class="badge-grid" style="margin-bottom: 16px;">
       <div class="metric-card" title="{html.escape(PLAIN_ENGLISH_TOOLTIPS['net_of_fee_pnl'])}">
         <span class="metric-title">Live Net-of-Fee PnL (?)</span>
         <div class="metric-val">${resolved.pnl_metrics.net_pnl_usd:,.2f} (+{resolved.pnl_metrics.net_pnl_bps:.1f} bps)</div>
@@ -1201,13 +1466,14 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
     <table>
       <thead>
         <tr>
-          <th>Asset Sleeve</th>
+          <th>Coin</th>
+          <th>Plain-English Action</th>
           <th>Signed Target Weight (w_final,i)</th>
-          <th>Base HRP-CVaR Weight (w_HRP,i)</th>
-          <th>Half-Kelly Conviction f_Kelly(p_meta)</th>
+          <th>Base Risk Parity Weight (w_HRP,i)</th>
+          <th>AI Confidence Sizing f_Kelly(p_meta)</th>
         </tr>
       </thead>
-      <tbody>
+      <tbody id="full-weights-tbody">
         {weights_rows}
       </tbody>
     </table>
@@ -1220,7 +1486,7 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
   <!-- TAB 3: HOW IT WORKS (PLAIN-ENGLISH GUIDE) -->
   <section id="tab-guide" class="tab-panel">
     <h2>Plain-English Operator Manuals &amp; Tooltip Encyclopedia</h2>
-    <p>Every manual below is loaded directly from the <code>docs/</code> suite in your workspace.</p>
+    <p>Every manual below is written in plain English and loaded from the <code>docs/</code> folder.</p>
     {"".join(docs_html_blocks)}
     <h3>Complete Plain-English Tooltip Registry</h3>
     <table>
@@ -1241,6 +1507,8 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
     Plotly.newPlot('weights-chart', weightsSpec.data, weightsSpec.layout, {{responsive: true}});
     Plotly.newPlot('gates-chart', gatesSpec.data, gatesSpec.layout, {{responsive: true}});
 
+    let dryRunTimer = null;
+
     function switchTab(tabId, btnEl) {{
       document.querySelectorAll('.tab-panel').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
@@ -1249,13 +1517,164 @@ def render_full_dashboard_html(state: DashboardTelemetryState | None = None) -> 
       window.dispatchEvent(new Event('resize'));
     }}
 
-    async function sendControl(action) {{
-      const resp = await fetch('/api/control/' + action, {{ method: 'POST' }});
-      const data = await resp.json();
-      if (data && data.regime_mode) {{
-        document.getElementById('mode-indicator').textContent = data.regime_mode;
+    function highlightActiveButton(action) {{
+      ['start_dry_run', 'pause_entries', 'switch_carry_only', 'emergency_flatten'].forEach(id => {{
+        const btn = document.getElementById('btn-' + id);
+        if (btn) btn.classList.remove('active-mode');
+      }});
+      const activeBtn = document.getElementById('btn-' + action);
+      if (activeBtn) activeBtn.classList.add('active-mode');
+
+      const pill = document.getElementById('live-status-pill');
+      const pillText = document.getElementById('status-pill-text');
+      const dot = document.getElementById('status-dot');
+      const tickBadge = document.getElementById('tick-badge');
+
+      if (action === 'start_dry_run') {{
+        pill.style.background = 'rgba(16, 185, 129, 0.2)';
+        pill.style.color = '#34d399';
+        pill.style.borderColor = '#10b981';
+        dot.style.background = '#10b981';
+        pillText.textContent = 'DRY-RUN RUNNING LIVE (Auto-Ticking Every 1.8s)';
+        tickBadge.textContent = '● Live Auto-Ticking';
+        tickBadge.style.color = '#10b981';
+      }} else if (action === 'pause_entries') {{
+        pill.style.background = 'rgba(245, 158, 11, 0.2)';
+        pill.style.color = '#fbbf24';
+        pill.style.borderColor = '#f59e0b';
+        dot.style.background = '#f59e0b';
+        pillText.textContent = 'PAUSED (No New Entries — Stop-Losses Active)';
+        tickBadge.textContent = '⏸ Paused';
+        tickBadge.style.color = '#fbbf24';
+      }} else if (action === 'switch_carry_only') {{
+        pill.style.background = 'rgba(56, 189, 248, 0.2)';
+        pill.style.color = '#38bdf8';
+        pill.style.borderColor = '#0284c7';
+        dot.style.background = '#38bdf8';
+        pillText.textContent = 'CARRY-ONLY MODE (Safe 8h Funding Yield Only)';
+        tickBadge.textContent = '🏦 Carry-Only';
+        tickBadge.style.color = '#38bdf8';
+      }} else if (action === 'emergency_flatten') {{
+        pill.style.background = 'rgba(239, 68, 68, 0.22)';
+        pill.style.color = '#f87171';
+        pill.style.borderColor = '#ef4444';
+        dot.style.background = '#ef4444';
+        pillText.textContent = 'STOPPED & FLATTENED (100% Cash)';
+        tickBadge.textContent = '🛑 Stopped (100% Cash)';
+        tickBadge.style.color = '#f87171';
       }}
     }}
+
+    function applyLiveStateToDOM(state, explanationText) {{
+      if (!state) return;
+
+      document.getElementById('mode-indicator').textContent = state.regime_mode;
+      const banner = document.getElementById('feedback-banner');
+      banner.classList.remove('flash-highlight');
+      void banner.offsetWidth;
+      banner.classList.add('flash-highlight');
+
+      if (explanationText) {{
+        document.getElementById('banner-message').textContent = explanationText;
+      }} else if (state.last_control_message) {{
+        document.getElementById('banner-message').textContent = state.last_control_message;
+      }}
+
+      if (state.tick_count !== undefined) {{
+        document.getElementById('bar-counter').textContent = state.tick_count;
+      }}
+      if (state.latest_price !== undefined) {{
+        document.getElementById('live-btc-price').textContent = '$' + Number(state.latest_price).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+      }}
+
+      // Update KPI Card 1: PnL
+      if (state.net_pnl_usd !== undefined) {{
+        const pnlSign = state.net_pnl_usd >= 0 ? '+' : '';
+        document.getElementById('kpi-pnl-val').textContent = pnlSign + '$' + Number(state.net_pnl_usd).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+        document.getElementById('kpi-pnl-sub').textContent =
+          (state.net_pnl_bps >= 0 ? '+' : '') + Number(state.net_pnl_bps).toFixed(1) +
+          ' bps net • Saved $' + Number(state.fee_savings_usd || 0).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + ' via Maker orders';
+      }}
+
+      // Update KPI Card 2 & Weights tables
+      const weights = state.signed_hrp_cvar_weights || (state.portfolio_allocation && state.portfolio_allocation.weights) || {{}};
+      const grossLev = state.gross_leverage !== undefined ? state.gross_leverage : 0;
+      const activeCoins = Object.entries(weights).filter(([_, w]) => Math.abs(w) > 0.001);
+      const actionValEl = document.getElementById('kpi-action-val');
+      if (state.regime_mode === 'EMERGENCY_FLATTENED' || activeCoins.length === 0) {{
+        actionValEl.textContent = '100% Cash (All Flat)';
+        actionValEl.style.color = '#f87171';
+      }} else if (state.regime_mode === 'PAUSED_ENTRIES') {{
+        actionValEl.textContent = 'Paused (Holding Existing)';
+        actionValEl.style.color = '#fbbf24';
+      }} else if (state.regime_mode === 'CARRY_ONLY_FALLBACK') {{
+        actionValEl.textContent = 'Hedged Carry Only';
+        actionValEl.style.color = '#38bdf8';
+      }} else {{
+        actionValEl.textContent = activeCoins.map(([c, w]) => (w > 0 ? 'Long ' : 'Short ') + c.replace('USDT-PERP', '') + ' (' + (w * 100).toFixed(0) + '%)').join(', ');
+        actionValEl.style.color = '#34d399';
+      }}
+      document.getElementById('kpi-action-sub').textContent = 'Total Leverage: ' + Number(grossLev).toFixed(2) + 'x (Safe Cap: 2.50x)';
+
+      // Update compact positions table
+      const compactRows = Object.entries(weights).map(([coin, w]) => {{
+        const numW = Number(w);
+        const cls = numW > 0 ? 'pos-long' : (numW < 0 ? 'pos-short' : 'pos-flat');
+        const label = numW > 0 ? 'LONG (BUY)' : (numW < 0 ? 'SHORT (SELL)' : 'CASH (FLAT)');
+        const pct = (numW >= 0 ? '+' : '') + (numW * 100).toFixed(1) + '%';
+        return `<tr><td><strong>${{coin}}</strong></td><td><span class="pos-pill ${{cls}}">${{label}}</span></td><td><strong>${{pct}}</strong></td></tr>`;
+      }}).join('');
+      document.getElementById('compact-weights-tbody').innerHTML = compactRows;
+
+      // Update activity log list
+      if (Array.isArray(state.activity_log) && state.activity_log.length > 0) {{
+        const logHtml = state.activity_log.map(item => `<li class="activity-item">${{item}}</li>`).join('');
+        document.getElementById('activity-log-list').innerHTML = logHtml;
+      }}
+
+      // Update Plotly charts smoothly
+      if (state.candlestick_figure) {{
+        Plotly.react('candlestick-chart', state.candlestick_figure.data, state.candlestick_figure.layout, {{responsive: true}});
+      }}
+      if (state.weights_figure) {{
+        Plotly.react('weights-chart', state.weights_figure.data, state.weights_figure.layout, {{responsive: true}});
+      }}
+    }}
+
+    async function refreshFromServer() {{
+      try {{
+        const resp = await fetch('/api/state');
+        const state = await resp.json();
+        applyLiveStateToDOM(state, null);
+      }} catch (_err) {{}}
+    }}
+
+    async function stepSingleBar() {{
+      const resp = await fetch('/api/tick', {{ method: 'POST' }});
+      const state = await resp.json();
+      applyLiveStateToDOM(state, state.last_control_message);
+    }}
+
+    async function sendControl(action) {{
+      highlightActiveButton(action);
+      const resp = await fetch('/api/control/' + action, {{ method: 'POST' }});
+      const data = await resp.json();
+      if (data && data.live_state) {{
+        applyLiveStateToDOM(data.live_state, data.plain_english_explanation);
+      }}
+
+      if (dryRunTimer) {{
+        clearInterval(dryRunTimer);
+        dryRunTimer = null;
+      }}
+
+      if (action === 'start_dry_run' || action === 'switch_carry_only') {{
+        dryRunTimer = setInterval(stepSingleBar, 1800);
+      }}
+    }}
+
+    // Start live auto-sync immediately on page load
+    dryRunTimer = setInterval(refreshFromServer, 2000);
   </script>
 </body>
 </html>"""

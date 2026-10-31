@@ -6,6 +6,9 @@ if [ ! -d "${PHOENIX_DIR}/.venv" ]; then
     PHOENIX_DIR="/Users/mbeale/.gemini/antigravity/scratch/nautilus_quant_m1max"
 fi
 
+LOG_FILE="${PHOENIX_DIR}/logs/phoenix.log"
+mkdir -p "${PHOENIX_DIR}/logs"
+
 export DYLD_LIBRARY_PATH="/opt/homebrew/opt/libomp/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 CMD="${1:-rise}"
@@ -13,9 +16,34 @@ CMD="${1:-rise}"
 case "${CMD}" in
     rise|start|up)
         echo "🔥 Phoenix rising at http://127.0.0.1:8080 (workspace: ${PHOENIX_DIR})..."
+        echo "📄 Live engine logs streaming to: ${LOG_FILE} (run 'phoenix logs' in another tab to watch)"
         cd "${PHOENIX_DIR}"
         ./scripts/tune_macos_kernel.sh
-        exec .venv/bin/uvicorn ui.api_server:app --host 127.0.0.1 --port 8080
+        exec .venv/bin/uvicorn ui.api_server:app --host 127.0.0.1 --port 8080 --log-level info
+        ;;
+    logs|log|watch)
+        touch "${LOG_FILE}"
+        echo "📡 Watching live Project Phoenix engine logs (${LOG_FILE}) — Press Ctrl+C to exit..."
+        echo "--------------------------------------------------------------------------------"
+        exec tail -n 30 -f "${LOG_FILE}"
+        ;;
+    status)
+        cd "${PHOENIX_DIR}"
+        .venv/bin/python -c '
+import urllib.request, json
+try:
+    with urllib.request.urlopen("http://127.0.0.1:8080/api/state", timeout=2) as r:
+        d = json.loads(r.read().decode())
+        print(f"🟢 Phoenix Engine RUNNING at http://127.0.0.1:8080")
+        print(f"   Mode       : {d.get(\"regime_mode\")} (Auto-Ticking: {d.get(\"auto_running\")})")
+        print(f"   Bar Count  : #{d.get(\"tick_count\")} | BTC Price: ${d.get(\"latest_price\"):,.2f}")
+        print(f"   Net Profit : +${d.get(\"net_pnl_usd\"):,.2f} (+{d.get(\"net_pnl_bps\")} bps)")
+        logs = d.get("activity_log", [])
+        if logs:
+            print(f"   Latest Log : {logs[0]}")
+except Exception as e:
+    print(f"🔴 Phoenix server is not currently running on port 8080 ({e}). Run: phoenix rise")
+'
         ;;
     test)
         cd "${PHOENIX_DIR}"
@@ -30,7 +58,7 @@ case "${CMD}" in
         exec ./run.sh
         ;;
     *)
-        echo "Usage: phoenix {rise|test|check|verify}"
+        echo "Usage: phoenix {rise|logs|status|test|check|verify}"
         exit 1
         ;;
 esac
