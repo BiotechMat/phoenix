@@ -97,6 +97,14 @@ from core.models import (
     compute_ewma_volatility,
     extract_continuous_and_binary_from_snapshots,
 )
+from risk.cascade_controls import (
+    CascadeController,
+    FragilityAssessment,
+    StressPosition,
+    adl_rank_estimate,
+    liquidation_stress_loss,
+    stablecoin_collateral_haircut,
+)
 from risk.circuit_breakers import CircuitBreakers, OperationalStatus
 from risk.partial_adjustment import square_root_impact, transfer_coefficient
 from risk.portfolio_allocator import HRPWeightScheduler, RollingHourlyReturnMatrix
@@ -372,6 +380,7 @@ class ControlCenterStateStore:
         stream_hub: StreamHub | None = None,
         trend_sleeve: TrendSleeve | None = None,
         circuit_breakers: CircuitBreakers | None = None,
+        cascade_controller: CascadeController | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
@@ -399,6 +408,10 @@ class ControlCenterStateStore:
         self._breakers: CircuitBreakers | None = circuit_breakers or (CircuitBreakers() if fetch_derivatives_inputs else None)
         self._blocked_entries: list[str] = []
         self._latest_transfer_coefficient: float | None = None
+        # Cascade and ADL controls (P3.4): reacts only to inputs that are actually available.
+        self._cascade: CascadeController = cascade_controller or CascadeController()
+        self._latest_fragility: dict[str, FragilityAssessment] = {}
+        self._collateral_haircut: float = 0.0
         self._latest_trend_signals: dict[str, TrendSignal] = {}
         self._trend_eval_bucket: int | None = None
 
@@ -1034,6 +1047,7 @@ class ControlCenterStateStore:
                     for coin, venues in self._latest_aux.predicted_fundings.items()
                 },
             },
+            "cascade": self.cascade_telemetry,
             "circuit_breakers": (
                 {
                     **self._breakers.snapshot(current_bar=len(self._history_bars) - 1).model_dump(mode="json"),
@@ -1194,6 +1208,53 @@ class ControlCenterStateStore:
                 "last_bar_flow": flow.model_dump(mode="json") if flow is not None else None,
             }
         return out
+
+    # ------------------------------------------------------------------ cascade and ADL controls (P3.4)
+
+    def _update_cascade(self, bars_by_coin: Mapping[str, DollarBar], snap: MultiAssetMarketSnapshot, ts_ns: int) -> None:
+        for coin, bar in bars_by_coin.items():
+            flow = self._latest_bar_flows.get(coin)
+            a_snap = snap.get_asset(coin)
+            depth = a_snap.l2_book.depth_10bps_usd if a_snap is not None and a_snap.l2_book.depth_10bps_usd > 0.0 else None
+            self._cascade.update(
+                coin,
+                ts_ns=ts_ns,
+                taker_buy_usd=flow.taker_buy_usd if flow is not None else None,
+                taker_sell_usd=flow.taker_sell_usd if flow is not None else None,
+                open_interest=bar.open_interest if bar.open_interest > 0.0 else None,
+                funding_rate_1h=bar.funding_rate_1h,
+                depth_10bps_usd=depth,
+            )
+        self._latest_fragility = {coin: self._cascade.assess(coin, ts_ns) for coin in bars_by_coin}
+        marks = self._latest_macro_inputs.stablecoin_marks
+        usdc = [q.price for q in marks.quotes if q.symbol == "USDC" and q.quote_currency == "USD"] if marks is not None else []
+        self._collateral_haircut = stablecoin_collateral_haircut({"USDC": usdc}) if usdc else 0.0
+
+    @property
+    def cascade_telemetry(self) -> dict[str, Any]:
+        equity = self._starting_capital_usd + self._total_realized_pnl
+        marks = self._current_marks()
+        snap = self.latest_market_snapshot
+        adl: dict[str, float] = {}
+        stress_inputs: list[StressPosition] = []
+        for key, pos in self._positions.open_positions.items():
+            m = marks.get(pos.asset)
+            mark = m.mark_price if m is not None else pos.entry_price
+            if pos.side < 0:
+                adl[key] = round(adl_rank_estimate(mark, pos.entry_price, pos.size * mark, equity), 6)
+            a_snap = snap.get_asset(pos.asset) if snap is not None else None
+            depth = a_snap.l2_book.depth_10bps_usd if a_snap is not None else 0.0
+            stress_inputs.append(StressPosition(asset=pos.asset, notional_usd=pos.size * mark, depth_10bps_usd=depth))
+        stress = liquidation_stress_loss(stress_inputs)
+        return {
+            "fragility": {coin: f.model_dump(mode="json") for coin, f in self._latest_fragility.items()},
+            "collateral_haircut": self._collateral_haircut,
+            "adl_rank_estimates": adl,
+            "stress_loss_usd": {k: round(v, 4) for k, v in stress.items()},
+            "stress_loss_pct_equity": round(sum(stress.values()) / equity, 6) if equity > 0 else 0.0,
+            "notes": "Fragile assets: directional entries halved, carry entries blocked, quoting paused. "
+            "Leg de-levering on hedges is reported, not executed (no leg resizing in the paper book).",
+        }
 
     # ------------------------------------------------------------------ impact (P3.1)
 
@@ -1888,6 +1949,7 @@ class ControlCenterStateStore:
         )
         cash_equity = self._starting_capital_usd + self._total_realized_pnl + sum(rec.net_pnl_usd for rec in closed)
         self._blocked_entries = []
+        self._update_cascade(bars_by_coin, snap, ts_close)
         if self._breakers is not None:
             for rec in closed:
                 self._breakers.record_closed_trade(rec, bar_index)
@@ -1905,6 +1967,12 @@ class ControlCenterStateStore:
                 m = marks.get(target.asset)
                 if m is None or m.bar is None:
                     continue
+                fragility = self._latest_fragility.get(target.asset)
+                if fragility is not None and fragility.fragile:
+                    if target.hedged:
+                        self._blocked_entries.append(f"{target.sleeve_id}:{target.asset}: cascade fragility ({', '.join(fragility.conditions_met)})")
+                        continue
+                    target = target.model_copy(update={"weight": target.weight * fragility.directional_multiplier})
                 if self._breakers is not None:
                     perm = self._breakers.permission(target.sleeve_id, target.asset, bar_index)
                     if not perm.allowed:
@@ -1916,7 +1984,7 @@ class ControlCenterStateStore:
                             continue
                 pos = self._positions.open_position(
                     target,
-                    equity_usd=cash_equity,
+                    equity_usd=cash_equity * (1.0 - self._collateral_haircut),
                     price=m.bar.close,
                     spot_price=m.spot_price,
                     bar_index=bar_index,
