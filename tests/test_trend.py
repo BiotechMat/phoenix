@@ -139,7 +139,7 @@ def test_enabled_trend_sleeve_opens_target_positions_from_hourly_history(tmp_pat
         parquet_path=tmp_path / "b.parquet",
         feed=feed,
         fetch_derivatives_inputs=False,
-        trend_sleeve=TrendSleeve(TrendSleeveConfig(enabled=True)),
+        trend_sleeve=TrendSleeve(TrendSleeveConfig(enabled=True, shadow=False)),  # past shadow: trades live
     )
     store.step_simulation_tick()
     btc = store.latest_targets[f"{TREND_SLEEVE_ID}:BTC"]

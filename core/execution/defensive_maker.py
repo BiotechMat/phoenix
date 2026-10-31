@@ -130,6 +130,8 @@ class DefensiveMakerConfig(BaseModel):
     vpin_bucket_volume: float = Field(default=100.0, gt=0.0)
     vpin_num_buckets: int = Field(default=50, ge=1)
     async_hawkes_refit: bool = True
+    lead_pull_k: float = Field(default=0.5, gt=0.0, description="Pull when the lead mid moves more than k x the HL spread")
+    lead_pull_window_ms: int = Field(default=700, ge=1)
 
     @classmethod
     def from_env_config(cls, env_config: EnvironmentConfig) -> DefensiveMakerConfig:
@@ -142,6 +144,23 @@ class DefensiveMakerConfig(BaseModel):
             max_gtx_rejections=env_config.max_gtx_rejections,
             rejection_backoff_ms=env_config.rejection_backoff_ms,
         )
+
+
+def should_pull_for_lead_move(
+    side: Literal["BUY", "SELL"],
+    lead_mid_change_bps: float | None,
+    hl_spread_bps: float,
+    k: float = 0.5,
+) -> bool:
+    """True when the lead venue moved against a resting quote by more than ``k`` x the HL spread (REINFORCEMENT_PLAN P4.1).
+
+    A resting bid is exposed when the lead mid falls; a resting ask when it rises. Spreads are floored at
+    0.1 bp so a locked or one-tick book still needs a real move.
+    """
+    if lead_mid_change_bps is None:
+        return False
+    threshold = k * max(hl_spread_bps, 0.1)
+    return lead_mid_change_bps < -threshold if side == "BUY" else lead_mid_change_bps > threshold
 
 
 class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
@@ -182,6 +201,7 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
         self._repeg_cooldown_ns: int = resolved_cfg.repeg_cooldown_ms * _MS_TO_NS
         self._rejection_backoff_ns: int = resolved_cfg.rejection_backoff_ms * _MS_TO_NS
 
+        self._lead_pull_counts: dict[str, int] = {}
         self._resting_orders: dict[str, RestingMakerOrderState] = {}
         self._consecutive_rejections: dict[str, int] = {}
         self._backoff_cooldown_until_ns: dict[str, int] = {}
@@ -224,6 +244,10 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
     def rejection_backoff_ns(self) -> int:
         """Cooldown in nanoseconds enforced after a 3-strike deeper GTX backoff (default 1_000_000_000)."""
         return self._rejection_backoff_ns
+
+    def lead_pull_count(self, instrument_id: str) -> int:
+        """Quotes pulled because the lead venue moved (kept apart from VPIN/Hawkes cancels)."""
+        return self._lead_pull_counts.get(instrument_id, 0)
 
     def get_resting_order(self, instrument_id: str) -> RestingMakerOrderState | None:
         """Return the currently tracked resting GTX order state for instrument_id, if any."""
@@ -634,8 +658,14 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
         circuit_breaker_active: bool = False,
         ts_ns: int | None = None,
         is_alo: bool = True,
+        lead_mid_change_bps: float | None = None,
     ) -> ExecutionOrderCommand:
-        """Evaluate order action with explicit Add-Liquidity-Only (ALO) constraints and routing."""
+        """Evaluate order action with explicit Add-Liquidity-Only (ALO) constraints and routing.
+
+        ``lead_mid_change_bps`` is the Binance/Bybit mid move over ``lead_pull_window_ms``; when it moves against
+        a resting quote by more than ``lead_pull_k`` x the HL spread the quote is pulled (CANCEL_LEAD_VENUE_PULL),
+        counted separately from the VPIN/Hawkes shield.
+        """
         now_ns = ts_ns if ts_ns is not None else time.time_ns()
 
         # 1. Hard stop-loss or emergency circuit-breaker exit
@@ -669,6 +699,30 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
                     f"TOXIC_SWEEP_SHIELD triggered (VPIN={vpin:.4f} > {self._config.vpin_toxic_threshold:.2f} "
                     f"or eta_Hawkes={hawkes_eta:.4f} > {self._config.hawkes_eta_toxic_threshold:.2f}): "
                     "cancelling all resting entry limit orders."
+                ),
+            )
+
+        # 2b. Lead-venue quote pull (P4.1)
+        resting = self._resting_orders.get(instrument_id)
+        pull_side: Literal["BUY", "SELL"] | None = resting_order_side or (resting.side if resting is not None else None)
+        mid = (best_bid + best_ask) / 2.0
+        spread_bps = (best_ask - best_bid) / mid * 10_000.0 if mid > 0.0 else 0.0
+        if pull_side is not None and should_pull_for_lead_move(pull_side, lead_mid_change_bps, spread_bps, self._config.lead_pull_k):
+            self._resting_orders.pop(instrument_id, None)
+            self._lead_pull_counts[instrument_id] = self._lead_pull_counts.get(instrument_id, 0) + 1
+            return ExecutionOrderCommand(
+                instrument_id=instrument_id,
+                ts_ns=now_ns,
+                action=ExecutionAction.CANCEL_LEAD_VENUE_PULL,
+                side="NONE",
+                target_price=0.0,
+                quantity=0.0,
+                post_only_gtx=False,
+                time_in_force="NONE",
+                consecutive_rejections=self._consecutive_rejections.get(instrument_id, 0),
+                reason=(
+                    f"LEAD_VENUE_PULL: lead mid moved {lead_mid_change_bps:+.2f} bps in {self._config.lead_pull_window_ms} ms "
+                    f"against the resting {pull_side} (threshold {self._config.lead_pull_k:.2f} x spread {spread_bps:.2f} bps)."
                 ),
             )
 
@@ -821,6 +875,7 @@ class DefensiveMakerExecutionAlgorithm(_NautilusExecutionAlgorithmBase):
 
 
 __all__ = [
+    "should_pull_for_lead_move",
     "ALOOrderConstraint",
     "ALO_ORDER_TYPE",
     "ALO_ROUTING_TAG",

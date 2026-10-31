@@ -88,6 +88,8 @@ from core.execution import (
     position_key,
 )
 from core.features import calibrate_optimal_d, compute_positioning_snapshots
+from core.execution.markouts import MarkoutTracker
+from core.fee_tiers import FeeTable, best_hedge_venue, fee_schedule_for, tier_index
 from core.streams import BarFlow, StreamHub
 from core.models import (
     EWMAVolatilityEstimator,
@@ -97,6 +99,8 @@ from core.models import (
     compute_ewma_volatility,
     extract_continuous_and_binary_from_snapshots,
 )
+from research.decay_monitor import DecayReport, evaluate_decay
+from research.validation.shadow import PreRegisteredThresholds, ShadowBook
 from risk.cascade_controls import (
     CascadeController,
     FragilityAssessment,
@@ -381,10 +385,19 @@ class ControlCenterStateStore:
         trend_sleeve: TrendSleeve | None = None,
         circuit_breakers: CircuitBreakers | None = None,
         cascade_controller: CascadeController | None = None,
+        fee_table: FeeTable | None = None,
+        account_volume_14d_usd: float = 0.0,
+        staking_discount: float = 0.0,
+        shadow_thresholds: Mapping[str, PreRegisteredThresholds] | None = None,
     ) -> None:
         self._ledger_path: Path = ledger_path or LEDGER_FILE
         self._parquet_path: Path = parquet_path or PARQUET_BARS_FILE
-        self._fee: FeeSchedule = fee_schedule or FeeSchedule.hyperliquid()
+        # Fee tier (P4.4): an explicit schedule wins; otherwise the venue's table and the account's 14-day volume.
+        self._fee_table: FeeTable | None = fee_table
+        self._account_volume_14d_usd: float = account_volume_14d_usd
+        self._fee: FeeSchedule = fee_schedule or (
+            fee_schedule_for(fee_table, account_volume_14d_usd, staking_discount) if fee_table is not None else FeeSchedule.hyperliquid()
+        )
         self._barrier_cfg: TripleBarrierConfig = TripleBarrierConfig(fee_schedule=self._fee)
         self._fetch_derivatives_inputs: bool = fetch_derivatives_inputs
         # Macro inputs (DVOL, stablecoin marks) and Hyperliquid auxiliary feeds share the live-feeds switch.
@@ -412,6 +425,16 @@ class ControlCenterStateStore:
         self._cascade: CascadeController = cascade_controller or CascadeController()
         self._latest_fragility: dict[str, FragilityAssessment] = {}
         self._collateral_haircut: float = 0.0
+        # Markout ladder (P4.2): fills scored against Hyperliquid mids from the stream hub.
+        self._markouts = MarkoutTracker()
+        # Shadow mode (P5.1): unvalidated or newly enabled sleeves trade here, never in the ledger.
+        self._shadow_positions = PositionManager(fee_schedule=self._fee, barrier_config=self._barrier_cfg)
+        self._shadow_books: dict[str, ShadowBook] = {}
+        self._shadow_thresholds: dict[str, PreRegisteredThresholds] = dict(shadow_thresholds or {})
+        self._latest_shadow_targets: dict[str, SleeveTarget] = {}
+        # Decay monitor (P5.2)
+        self._latest_decay: DecayReport | None = None
+        self._last_decay_check_ns: int | None = None
         self._latest_trend_signals: dict[str, TrendSignal] = {}
         self._trend_eval_bucket: int | None = None
 
@@ -840,13 +863,52 @@ class ControlCenterStateStore:
         if self._history_bars:
             self._last_retrain_ts_ns = self._history_bars[-1].ts_close_ns
 
+    def _check_decay(self, ts_close_ns: int) -> bool:
+        """Daily decay check on the live features (P5.2); returns True when a breach should trigger a retrain."""
+        if self._last_decay_check_ns is not None and ts_close_ns - self._last_decay_check_ns < RETRAIN_INTERVAL_NS:
+            return False
+        bars = self._history_bars[-FEATURE_WINDOW_BARS:]
+        if len(bars) < 400:
+            return False
+        self._last_decay_check_ns = ts_close_ns
+        try:
+            snaps = compute_positioning_snapshots(bars, close_ffd_config=self._ffd_close_cfg)
+            x, _, _ = extract_continuous_and_binary_from_snapshots(snaps)
+            feats = {name: x[:, i] for i, name in enumerate(("ffd_close_zscore", "ffd_oi_zscore", "oi_funding_basis_zscore"))}
+            self._latest_decay = evaluate_decay(feats, np.array([b.close for b in bars], dtype=np.float64))
+        except Exception as exc:
+            logger.warning("Decay check failed: %s", exc)
+            return False
+        return self._latest_decay.retrain_triggered
+
+    @property
+    def decay_telemetry(self) -> dict[str, Any]:
+        rep = self._latest_decay
+        if rep is None:
+            return {"available": False, "reason": "needs 400 bars of history"}
+        return {
+            "available": True,
+            "retrain_triggered": rep.retrain_triggered,
+            "breached_features": rep.breached_features,
+            "recommended_cadence_bars": rep.recommended_cadence_bars,
+            "features": {
+                n: {"half_life_bars": f.half_life_bars, "long_run_ic": f.long_run_ic, "latest_rolling_ic": (f.rolling_ic[-1] if f.rolling_ic else None), "breached": f.breached}
+                for n, f in rep.features.items()
+            },
+        }
+
     def _maybe_retrain(self, ts_close_ns: int) -> None:
-        """Retrain on the daily schedule from the Parquet store; keep the previous worker on any skip."""
+        """Retrain on the daily schedule, or early on an IC breach (P5.2); keep the previous worker on any skip."""
         if self._last_retrain_ts_ns is None:
             self._last_retrain_ts_ns = ts_close_ns
             return
-        if ts_close_ns - self._last_retrain_ts_ns < RETRAIN_INTERVAL_NS:
+        decay_breach = self._check_decay(ts_close_ns)
+        if ts_close_ns - self._last_retrain_ts_ns < RETRAIN_INTERVAL_NS and not decay_breach:
             return
+        if decay_breach:
+            line = f"[{self._now_str()} • DECAY] IC breach on {', '.join(self._latest_decay.breached_features if self._latest_decay else [])}: retraining early."
+            self._activity_log.append(line)
+            _append_log_line(line)
         self._last_retrain_ts_ns = ts_close_ns
         training_bars = _load_training_bars_from_parquet(self._parquet_path)
         try:
@@ -1047,6 +1109,9 @@ class ControlCenterStateStore:
                     for coin, venues in self._latest_aux.predicted_fundings.items()
                 },
             },
+            "shadow": self.shadow_telemetry,
+            "decay": self.decay_telemetry,
+            "fees": self.fee_telemetry,
             "cascade": self.cascade_telemetry,
             "circuit_breakers": (
                 {
@@ -1208,6 +1273,120 @@ class ControlCenterStateStore:
                 "last_bar_flow": flow.model_dump(mode="json") if flow is not None else None,
             }
         return out
+
+    # ------------------------------------------------------------------ shadow mode (P5.1)
+
+    @property
+    def shadow_sleeve_ids(self) -> set[str]:
+        ids: set[str] = set()
+        if not self._derivatives_alpha_sleeve.config.allocate:
+            ids.add(SLEEVE_DERIVATIVES)
+        if self._trend_sleeve.enabled and self._trend_sleeve.config.shadow:
+            ids.add(TREND_SLEEVE_ID)
+        return ids
+
+    def _step_shadow_book(self, bar_index: int, ts_ns: int, marks: Mapping[str, BarMarks], regime_veto: bool, sigma_bar: float) -> None:
+        closed = self._shadow_positions.process_bar(bar_index=bar_index, ts_ns=ts_ns, marks=marks, targets=self._latest_shadow_targets, regime_veto=regime_veto)
+        for rec in closed:
+            book = self._shadow_books.setdefault(rec.sleeve_id, ShadowBook(rec.sleeve_id, self._shadow_thresholds.get(rec.sleeve_id), capital_usd=self._starting_capital_usd))
+            book.record(rec, self._fee)
+        if regime_veto:
+            return
+        equity = self._starting_capital_usd + self._total_realized_pnl
+        for tgt in self._latest_shadow_targets.values():
+            m = marks.get(tgt.asset)
+            if tgt.weight == 0.0 or m is None or m.bar is None:
+                continue
+            self._shadow_positions.open_position(tgt, equity_usd=equity, price=m.bar.close, spot_price=m.spot_price, bar_index=bar_index, ts_ns=ts_ns, sigma_bar=sigma_bar)
+            self._shadow_books.setdefault(tgt.sleeve_id, ShadowBook(tgt.sleeve_id, self._shadow_thresholds.get(tgt.sleeve_id), capital_usd=self._starting_capital_usd))
+
+    @property
+    def shadow_positions(self) -> PositionManager:
+        return self._shadow_positions
+
+    @property
+    def shadow_telemetry(self) -> dict[str, Any]:
+        open_by: dict[str, int] = {}
+        for p in self._shadow_positions.open_positions.values():
+            open_by[p.sleeve_id] = open_by.get(p.sleeve_id, 0) + 1
+        return {
+            "sleeves": sorted(self.shadow_sleeve_ids),
+            "status": {sid: b.status().model_dump(mode="json") for sid, b in self._shadow_books.items()},
+            "open_positions": open_by,
+        }
+
+    # ------------------------------------------------------------------ fee tier and hedge venue (P4.4)
+
+    @property
+    def fee_telemetry(self) -> dict[str, Any]:
+        hedge: dict[str, Any] = {}
+        other = FeeSchedule.usdt_perp()  # Binance/Bybit base tier: an assumption, the paper account does not trade there
+        fees = {"HlPerp": self._fee.roundtrip_maker_plus_slippage_bps * 1e-4, "BinPerp": other.roundtrip_maker_plus_slippage_bps * 1e-4, "BybitPerp": other.roundtrip_maker_plus_slippage_bps * 1e-4}
+        for coin, venues in self._latest_aux.predicted_fundings.items():
+            choice = best_hedge_venue({v: pf.rate_per_day for v, pf in venues.items()}, fees)
+            if choice is not None:
+                hedge[coin] = choice.model_dump(mode="json")
+        return {
+            "maker_bps": self._fee.maker_bps,
+            "taker_bps": self._fee.taker_bps,
+            "tier": tier_index(self._fee_table, self._account_volume_14d_usd) if self._fee_table is not None else 0,
+            "volume_14d_usd": self._account_volume_14d_usd,
+            "source": "venue fee table" if self._fee_table is not None else "Hyperliquid base tier",
+            "carry_hedge_venue": hedge,
+            "other_venue_fees_note": "Binance/Bybit priced at the base USDT tier (assumption).",
+        }
+
+    # ------------------------------------------------------------------ markouts (P4.2)
+
+    def _fill_clock_ms(self, snap: MultiAssetMarketSnapshot) -> int:
+        """Live fills are timestamped on the wall clock; replays use the snapshot (bar) time."""
+        if isinstance(self._feed, HyperliquidCandleBarFeed):
+            return int(datetime.now(timezone.utc).timestamp() * 1000)
+        return snap.timestamp_ns // 1_000_000
+
+    def _record_markout_fills(self, opened: Sequence[Position], closed: Sequence[ClosedTradeRecord], snap: MultiAssetMarketSnapshot) -> None:
+        now_ms = self._fill_clock_ms(snap)
+        hub = self._stream_hub
+        for p in opened:
+            lead = hub.lead_mids.lead_mid_change_bps(p.asset, 700) if hub is not None else None
+            self._markouts.record_fill(
+                fill_id=f"open:{p.position_id}", coin=p.asset, side="BUY" if p.side > 0 else "SELL", price=p.entry_price,
+                ts_ms=now_ms, notional_usd=p.notional_usd, sleeve_id=p.sleeve_id, lead_move_bps=lead,
+            )
+        for c in closed:
+            lead = hub.lead_mids.lead_mid_change_bps(c.asset, 700) if hub is not None else None
+            self._markouts.record_fill(
+                fill_id=f"close:{c.trade_id}", coin=c.asset, side="SELL" if c.side > 0 else "BUY", price=c.exit_price,
+                ts_ms=now_ms, notional_usd=c.size * c.exit_price, sleeve_id=c.sleeve_id, lead_move_bps=lead,
+            )
+
+    def resolve_markouts(self, now_ms: int | None = None) -> int:
+        """Resolve pending markouts against the hub's Hyperliquid mids (no-op without a stream hub)."""
+        if self._stream_hub is None:
+            return 0
+        t = now_ms if now_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
+        return self._markouts.resolve(self._stream_hub.hl_mids.mid_at, t)
+
+    @property
+    def markout_tracker(self) -> MarkoutTracker:
+        return self._markouts
+
+    @property
+    def markout_telemetry(self) -> dict[str, Any]:
+        self.resolve_markouts()
+        tr = self._markouts
+        return {
+            "fills": len(tr.fills),
+            "horizons_ms": list(tr.horizons),
+            "all": tr.summary("all"),
+            "by_sleeve": tr.summary("sleeve_id"),
+            "by_size_bucket": tr.summary("size_bucket"),
+            "by_lead_state": tr.summary("lead_state"),
+            "ewma_30s_bps": tr.ewma_30s_bps,
+            "vpin_threshold_effective": tr.toxicity_threshold(0.60),
+            "mid_source": "hyperliquid_bbo_stream" if self._stream_hub is not None else "unavailable",
+            "recent": [f.model_dump(mode="json") for f in tr.fills[-10:]],
+        }
 
     # ------------------------------------------------------------------ cascade and ADL controls (P3.4)
 
@@ -1491,7 +1670,6 @@ class ControlCenterStateStore:
                 epistemic_gate_passed=True,
             )
             for coin, sig in self._latest_derivatives_signals.items()
-            if self._derivatives_alpha_sleeve.config.allocate
         ]
         carry_inputs = [
             AssetAllocationInput(
@@ -1580,6 +1758,11 @@ class ControlCenterStateStore:
                         f"vol {tsig.vol_annual:.0%}, corr adj {tsig.corr_adjustment:.2f}"
                     ),
                 )
+
+        # Shadow sleeves (P5.1) trade in a separate book; only live targets reach the ledger and the leverage cap.
+        shadow_ids = self.shadow_sleeve_ids
+        self._latest_shadow_targets = {k: t for k, t in targets.items() if t.sleeve_id in shadow_ids}
+        targets = {k: t for k, t in targets.items() if t.sleeve_id not in shadow_ids}
 
         # Global gross leverage cap across sleeves (hedged carry counts both legs).
         gross = sum(abs(t.weight) * (2.0 if t.hedged else 1.0) for t in targets.values())
@@ -1942,6 +2125,7 @@ class ControlCenterStateStore:
         closed = self._positions.process_bar(
             bar_index=bar_index, ts_ns=ts_close, marks=marks, targets=targets, regime_veto=regime_veto
         )
+        self._step_shadow_book(bar_index, ts_close, marks, regime_veto, sigma_bar)
         opened: list[Position] = []
         entries_allowed = (
             not regime_veto
@@ -1994,6 +2178,8 @@ class ControlCenterStateStore:
                 if pos is not None:
                     opened.append(pos)
                     self._maker_fills += 2 if pos.hedged else 1
+
+        self._record_markout_fills(opened, closed, snap)
 
         # 6. Ledger: realise only what closed on this bar.
         bar_net_pnl = 0.0
@@ -2450,6 +2636,7 @@ def create_app(store: ControlCenterStateStore | None = None) -> FastAPI:
             "risk_committee": state_store.risk_committee_output.model_dump(mode="json"),
             "sleeve_telemetry": state_store.sleeve_telemetry,
             "data_availability": state_store.data_availability.model_dump(mode="json"),
+            "markouts": state_store.markout_telemetry,
         }
 
     @app.post("/api/tick")

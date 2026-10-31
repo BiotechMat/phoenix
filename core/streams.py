@@ -698,6 +698,9 @@ class StreamHub:
         self.liquidations = LiquidationBook(self.coins)
         self.lead_mids = LeadMidBuffer()
         self.boundaries = BoundaryImbalanceTracker(self.tape)
+        from core.execution.markouts import MidHistory
+
+        self.hl_mids = MidHistory()
         self._trades_dir = trades_dir
         self._flush_interval_s = flush_interval_s
         self._okx_poll = enable_okx_liquidation_poll
@@ -800,7 +803,9 @@ class StreamHub:
         return f"{BINANCE_FUTURES_WS_URL}?streams={streams}"
 
     def _hl_subscribe(self) -> list[dict[str, Any]]:
-        return [{"method": "subscribe", "subscription": {"type": "trades", "coin": c}} for c in self.coins]
+        subs = [{"method": "subscribe", "subscription": {"type": "trades", "coin": c}} for c in self.coins]
+        subs += [{"method": "subscribe", "subscription": {"type": "bbo", "coin": c}} for c in self.coins]
+        return subs
 
     def _bybit_subscribe(self) -> list[dict[str, Any]]:
         args = [f"orderbook.1.{c}USDT" for c in self.coins] + [f"allLiquidation.{c}USDT" for c in self.coins]
@@ -873,6 +878,15 @@ class StreamHub:
                 by_coin.setdefault(coin, []).append(trade)
             for coin, trades in by_coin.items():
                 self.tape.add(coin, trades, received_ms=now_ms)
+        elif msg.get("channel") == "bbo":
+            data = msg.get("data") or {}
+            levels = data.get("bbo") or []
+            if len(levels) == 2 and levels[0] and levels[1]:
+                try:
+                    mid = (float(levels[0]["px"]) + float(levels[1]["px"])) / 2.0
+                    self.hl_mids.add(str(data.get("coin", "")).upper(), now_ms, mid)
+                except (KeyError, TypeError, ValueError):
+                    pass
         elif msg.get("channel") in ("pong", "subscriptionResponse"):
             for c in self.coins:
                 self.tape.heartbeat(c, now_ms)

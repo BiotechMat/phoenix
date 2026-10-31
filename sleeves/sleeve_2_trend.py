@@ -36,6 +36,7 @@ class TrendSleeveConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     enabled: bool = Field(default=False, description="Ships off; enable only after CPCV and shadow mode")
+    shadow: bool = Field(default=True, description="When enabled, trade in the shadow book first (P5.1); False trades live")
     lookbacks_hours: tuple[int, ...] = (24, 168, 720)
     vol_ewma_span_hours: int = Field(default=25 * 24, ge=2)
     target_vol_annual: float = Field(default=0.20, gt=0.0)
