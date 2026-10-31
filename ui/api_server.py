@@ -98,6 +98,7 @@ from core.models import (
     extract_continuous_and_binary_from_snapshots,
 )
 from risk.circuit_breakers import CircuitBreakers, OperationalStatus
+from risk.partial_adjustment import square_root_impact, transfer_coefficient
 from risk.portfolio_allocator import HRPWeightScheduler, RollingHourlyReturnMatrix
 from sentiment.committee_models import (
     AdversarialRedTeamCritic,
@@ -397,6 +398,7 @@ class ControlCenterStateStore:
         # Circuit breakers (P3.2): on by default in live mode; replays and tests pass them explicitly.
         self._breakers: CircuitBreakers | None = circuit_breakers or (CircuitBreakers() if fetch_derivatives_inputs else None)
         self._blocked_entries: list[str] = []
+        self._latest_transfer_coefficient: float | None = None
         self._latest_trend_signals: dict[str, TrendSignal] = {}
         self._trend_eval_bucket: int | None = None
 
@@ -1193,6 +1195,23 @@ class ControlCenterStateStore:
             }
         return out
 
+    # ------------------------------------------------------------------ impact (P3.1)
+
+    def _impact_bps(self, coin: str, w_hrp: float, sigma_bar: float) -> float:
+        """Square-root impact of a target-sized order in bps, using the asset's 24h volume from the live snapshot."""
+        snap = self.latest_market_snapshot
+        a_snap = snap.get_asset(coin) if snap is not None else None
+        volume = float(a_snap.day_volume_usd) if a_snap is not None else 0.0
+        equity = self._starting_capital_usd + self._total_realized_pnl
+        notional = max(0.0, w_hrp) * equity * 0.5  # half-Kelly at full conviction bounds the order size
+        sigma_daily = max(sigma_bar, 0.0) * math.sqrt(96.0)
+        return square_root_impact(sigma_daily, notional, volume) * 10_000.0
+
+    @property
+    def transfer_coefficient(self) -> float | None:
+        """Correlation between raw signed sleeve scores and executed directional weights on the last bar."""
+        return self._latest_transfer_coefficient
+
     # ------------------------------------------------------------------ circuit breakers (P3.2)
 
     def _operational_status(self, snap: MultiAssetMarketSnapshot) -> OperationalStatus:
@@ -1388,7 +1407,7 @@ class ControlCenterStateStore:
         )
 
         ub, lb = compute_effective_barriers(max(sigma_bar, 0.0), self._barrier_cfg)
-        meta_expected_bps = (meta.p_meta * ub - (1.0 - meta.p_meta) * lb) * 10_000.0
+        meta_expected_bps = (meta.p_meta * ub - (1.0 - meta.p_meta) * lb) * 10_000.0 - self._impact_bps("BTC", hrp["BTC"], sigma_bar)
         meta_inputs = [
             AssetAllocationInput(
                 asset_id="BTC",
@@ -1406,7 +1425,7 @@ class ControlCenterStateStore:
                 y_primary=sig.primary_direction,
                 w_hrp=hrp[coin],
                 p_meta=sig.p_meta,
-                expected_gross_return_bps=sig.expected_gross_edge_bps,
+                expected_gross_return_bps=sig.expected_gross_edge_bps - self._impact_bps(coin, hrp[coin], sigma_bar),
                 fee_schedule=self._fee,
                 epistemic_gate_passed=True,
             )
@@ -1520,6 +1539,14 @@ class ControlCenterStateStore:
             set(meta_alloc.rejected_for_fees)
             | set(deriv_alloc.rejected_for_fees if deriv_alloc is not None else [])
             | set(carry_alloc.rejected_for_fees if carry_alloc is not None else [])
+        )
+        # Transfer coefficient: how faithfully executed directional weights follow the raw signed scores.
+        raw_scores = {a: 0.0 for a in ASSETS}
+        raw_scores["BTC"] += float(meta.effective_direction) * max(0.0, 2.0 * meta.p_meta - 1.0)
+        for coin, dsig in self._latest_derivatives_signals.items():
+            raw_scores[coin] += float(dsig.primary_direction) * max(0.0, 2.0 * dsig.p_meta - 1.0)
+        self._latest_transfer_coefficient = transfer_coefficient(
+            [raw_scores[a] for a in ASSETS], [per_asset_directional[a] for a in ASSETS]
         )
         allocation = PortfolioAllocationOutput(
             weights={a: round(w, 6) for a, w in per_asset_directional.items()},
@@ -2285,6 +2312,7 @@ def _serialize_live_state(store: ControlCenterStateStore) -> dict[str, Any]:
             "data_availability": store.data_availability.model_dump(mode="json"),
             "live_feeds": store.data_availability.live_feeds(),
             "streams": store.stream_telemetry,
+            "transfer_coefficient": store.transfer_coefficient,
             "macro_inputs": store.latest_macro_inputs.model_dump(mode="json", exclude={"stablecoin_marks", "dvol"}),
             "sigma_bar_ewma96": store.sigma_bar,
         }

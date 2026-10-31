@@ -170,6 +170,7 @@ class TrendBacktest(BaseModel):
     assets: tuple[str, ...]
     ts_ms: NDArray[np.int64]
     weights: NDArray[np.float64] = Field(description="(T, N) weight held over t -> t+1")
+    aims: NDArray[np.float64] = Field(description="(T, N) capped target weight before the rebalance policy")
     forecasts: NDArray[np.float64]
     simple_returns_next: NDArray[np.float64] = Field(description="(T, N) close[t+1] / close[t] - 1; NaN at the end")
 
@@ -221,6 +222,7 @@ def backtest_trend(
         assets=assets,
         ts_ms=np.asarray(ts_ms, dtype=np.int64),
         weights=weights,
+        aims=capped,
         forecasts=np.where(np.isfinite(forecasts), forecasts, 0.0),
         simple_returns_next=nxt,
     )
