@@ -295,6 +295,19 @@ Data note: Hyperliquid's funding history settles every 8 hours in its early peri
 
 **Phase 4 gate**: median 30s markout improves versus Phase 0 baseline in paper replay; no increase in reject storms.
 
+### Phase 4 implementation status (2026-10-31)
+
+Evaluated on a 25-minute recording of Hyperliquid BBO and trades with Binance and Bybit top of book (805,530 events, BTC, ETH and SOL, October 2026). A six-minute BTC slice of it is a test fixture.
+
+| Task | Status | Where |
+|------|--------|-------|
+| P4.1 | Done; **acceptance passes on recorded ticks**. `should_pull_for_lead_move` cancels a resting quote when the Binance/Bybit median mid moved against it by more than 0.5 x the Hyperliquid spread within 700 ms; the defensive maker emits `CANCEL_LEAD_VENUE_PULL`, counted apart from VPIN/Hawkes cancels. `research/quote_sim.py` replays the recording with a join-the-touch quoter and scores each fill as adverse when the 5 s mid moved through it. Adverse-fill rate without and with the pull: BTC 25.8% to 19.5% (1,169 to 1,006 fills, 246 pulls), ETH 22.2% to 15.0%, SOL 32.2% to 21.5%. The median 5 s markout is unchanged. The six-minute BTC fixture (23.6% to 21.5%) is the acceptance test. | `core/execution/defensive_maker.py`, `research/quote_sim.py`, `tests/test_lead_pull.py` |
+| P4.2 | Done. `core/execution/markouts.py` records every paper fill with size bucket, minutes to funding, lead/lag state and sleeve, and resolves mid-to-mid markouts at 1 s, 5 s, 10 s, 30 s, 60 s and 5 min against the Hyperliquid BBO mids the stream hub now carries. Medians and percentiles are in `/api/forensics`; the slow EWMA of the 30 s median tightens the VPIN threshold when fills are being picked off. A fixture test computes the ladder. | `core/execution/markouts.py`, `ui/api_server.py` |
+| P4.3 | Queue model and switch rule built; **acceptance fails**. `research/queue_sim.py` places a new order at the back of the displayed size, advances it on trades and pro-rata cancels ahead, fills on trade-through, holds orders in the front third instead of re-pegging (unless P4.1 fires), applies a 30 s post-fill cooldown, and switches to taker when half-spread minus taker fee exceeds the expected adverse move. Net per fill (30 s markout minus the 1.5 bp maker fee), re-peg / queue-aware / queue-aware with lead pull: BTC −2.52 / −2.91 / −2.41 bp, ETH −2.97 / −4.01 / −1.05 bp, SOL −2.75 / −3.75 / −3.25 bp. Queue-awareness alone is worse on every coin; with the lead pull it beats re-peg on BTC and ETH and loses on SOL. The taker switch never fired. Every policy loses after the maker fee at tier 0, so passive quoting is not profitable at this fee level. The censoring-aware fill-time model (`core/execution/fill_model.py`) needs our own resting orders and was not built. | `research/queue_sim.py`, `tests/test_queue_sim.py` |
+| P4.4 | Done. `core/fee_tiers.py` reads the fee table from Hyperliquid `userFees`, derives the tier from 14-day volume and the staking discount, and feeds the store's fee schedule, so the carry hurdle uses the live tier; a test rejects a carry trade at tier 0 and accepts it at tier 3. The carry hedge venue is chosen net of fees from `predictedFundings`, and parents above 2% of one-minute volume are sliced passive-first. | `core/fee_tiers.py`, `ui/api_server.py`, `tests/test_fee_tiers.py` |
+
+**Phase 4 gate: not met.** The lead pull lowers adverse fills but leaves the median 5 s markout unchanged; no paper replay has yet shown a better median 30 s markout than the Phase 0 baseline. No reject storms were observed, but the paper book does not exercise a live order gateway.
+
 ---
 
 ## Phase 5: Process (from week 4, ongoing)
@@ -322,6 +335,15 @@ Data note: Hyperliquid's funding history settles every 8 hours in its early peri
 - Steps: Monte Carlo trade-order shuffling, MAE/MFE by regime, transfer coefficient, turnover and impact cost per sleeve in the tournament report.
 - Acceptance: report renders for the baseline.
 - Effort: S. Depends on: P1.7.
+
+### Phase 5 implementation status (2026-10-31)
+
+| Task | Status | Where |
+|------|--------|-------|
+| P5.1 | Workflow built; **no sleeve has completed it**. `research/validation/shadow.py` pre-registers kill thresholds from the CPCV path distribution (live Sharpe below 80% of the median path, drawdown beyond the 5th-percentile path) and reconciles realised against modelled slippage and markouts per shadow trade. Unvalidated or newly enabled sleeves (the derivatives sleeve with allocation off, the trend sleeve with shadow on, now the default) trade in a separate shadow book that never reaches the ledger. Shadow statistics are in the sleeve telemetry. No Phase 2 sleeve passed its gates, so none has entered the 200-trade shadow run. | `research/validation/shadow.py`, `ui/api_server.py` |
+| P5.2 | Done. `research/decay_monitor.py` computes rolling sign-aligned IC and half-lives per live feature and recommends a cadence equal to the shortest half-life. A breach triggers an early retrain under the P0.7 rules; a test forces one. Half-lives and breaches are in the sleeve telemetry. | `research/decay_monitor.py`, `ui/api_server.py`, `tests/test_decay_monitor.py` |
+| P5.3 | Done; **acceptance passes narrowly**. `core/models/online_residual.py` fits a ridge on the meta-labeller's training residuals with exponential forgetting (0.999 per row), which can be warm-started without a refit. The store abstains (probability 0.5, gate closed) when the live Mahalanobis distance exceeds the 99th percentile of the training distances, and skips a retrain when more than 30% of the latest 96 rows are beyond the current gate. It is wired in the store's fit and predict path rather than inside the worker, so the worker's contract is unchanged. `research/residual_eval.py` on real BTC bars over CPCV: out-of-fold log-loss 0.23558 without and 0.23316 with the residual layer, lower in 60% of folds (the threshold), abstention rate 1.2%. | `core/models/online_residual.py`, `research/residual_eval.py`, `ui/api_server.py` |
+| P5.4 | Done. `research/tournament_report.py` adds, per candidate, Monte Carlo trade-order shuffling (500 seeded permutations of per-trade net returns, 5th/50th/95th-percentile maximum drawdown), MAE/MFE by positioning regime at entry, transfer coefficient, turnover and square-root impact cost, and renders a text table. On the baseline candidates the realised maximum drawdown exceeds the shuffled 95th percentile for most of them, so their losses cluster in time more than chance would give. | `research/tournament_report.py`, `tests/test_tournament_report.py` |
 
 ---
 

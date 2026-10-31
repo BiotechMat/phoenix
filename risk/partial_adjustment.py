@@ -15,6 +15,7 @@ from collections.abc import Sequence
 import math
 
 import numpy as np
+from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -48,7 +49,7 @@ def uncertainty_kelly_gamma(edge: float, edge_standard_error: float) -> float:
     return 0.5 * min(1.0, edge / (2.0 * edge_standard_error))
 
 
-def transfer_coefficient(scores: Sequence[float], weights: Sequence[float]) -> float | None:
+def transfer_coefficient(scores: Sequence[float] | NDArray[np.float64], weights: Sequence[float] | NDArray[np.float64]) -> float | None:
     """Correlation between raw signal scores and executed weights across assets (None when undefined)."""
     s = np.asarray(scores, dtype=np.float64)
     w = np.asarray(weights, dtype=np.float64)

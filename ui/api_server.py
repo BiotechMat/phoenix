@@ -89,6 +89,7 @@ from core.execution import (
 )
 from core.features import calibrate_optimal_d, compute_positioning_snapshots
 from core.execution.markouts import MarkoutTracker
+from core.models.online_residual import OnlineResidualRidge, abstention_threshold, outlier_guard_skip
 from core.fee_tiers import FeeTable, best_hedge_venue, fee_schedule_for, tier_index
 from core.streams import BarFlow, StreamHub
 from core.models import (
@@ -528,6 +529,10 @@ class ControlCenterStateStore:
         self._hawkes_monitor = RecursiveHawkesMonitor(async_refit=False)
         self._ffd_close_cfg: FFDWeightsConfig = raw_state.ffd_config
         self._ml_worker: LightGBMMetaLabelWorker | None = None
+        self._residual: OnlineResidualRidge | None = None
+        self._abstain_di: float = float("inf")
+        self._predictions_made: int = 0
+        self._abstentions: int = 0
         self._last_retrain_ts_ns: int | None = None
         self._last_retrain_message: str = ""
         self._train_initial_ml_worker()
@@ -830,6 +835,20 @@ class ControlCenterStateStore:
             ([1e-4], compute_ewma_volatility(np.diff(log_close), span=96))
         )[:n_keep]
 
+        # Outlier-protection guard (P5.3): skip when the newest rows are mostly beyond the current model's gate.
+        current = self._ml_worker
+        if current is not None:
+            recent = x_train[-96:]
+            try:
+                new_di = current.outlier_gate.compute_di(current.svd_orthogonalizer.transform(recent))
+                skip, frac = outlier_guard_skip(new_di, current.outlier_gate.di_threshold)
+            except Exception:
+                skip, frac = False, 0.0
+            if skip:
+                self._last_retrain_message = f"outlier guard: {frac:.0%} of the newest rows beyond the gate; retrain skipped, previous model retained"
+                logger.warning("Meta-labeller fit skipped: %s.", self._last_retrain_message)
+                return None
+
         worker = LightGBMMetaLabelWorker(di_threshold=3.50, n_jobs=4, fee_schedule=self._fee)
         worker.fit(
             x_train,
@@ -837,6 +856,16 @@ class ControlCenterStateStore:
             liquidation_exhaustion_flag_train=flags_train,
             sigma_bar_train=sigma_series,
         )
+        # Online residual layer and abstention threshold (P5.3), fitted on the same training rows.
+        try:
+            p_train = np.asarray(worker.predict_proba(x_train, liquidation_exhaustion_flag=flags_train, sigma_bar=sigma_series), dtype=np.float64)
+            self._residual = OnlineResidualRidge(x_train.shape[1]).fit(x_train, y_meta - p_train)
+            train_di = worker.outlier_gate.compute_di(worker.svd_orthogonalizer.transform(x_train))
+            self._abstain_di = abstention_threshold(train_di)
+        except Exception as exc:
+            logger.warning("Residual layer fit failed (%s); predictions use LightGBM alone.", exc)
+            self._residual = None
+            self._abstain_di = float("inf")
         self._ffd_close_cfg = ffd_cfg
         pos_rate = float(np.mean(y_meta))
         self._last_retrain_message = f"fitted on {n_keep} labelled real bars (positive rate {pos_rate:.1%})"
@@ -1111,6 +1140,7 @@ class ControlCenterStateStore:
             },
             "shadow": self.shadow_telemetry,
             "decay": self.decay_telemetry,
+            "residual_layer": self.residual_telemetry,
             "fees": self.fee_telemetry,
             "cascade": self.cascade_telemetry,
             "circuit_breakers": (
@@ -1273,6 +1303,28 @@ class ControlCenterStateStore:
                 "last_bar_flow": flow.model_dump(mode="json") if flow is not None else None,
             }
         return out
+
+    # ------------------------------------------------------------------ residual layer and abstention (P5.3)
+
+    def _apply_residual_and_abstention(self, meta: MetaPredictionOutput, x_row: np.ndarray) -> MetaPredictionOutput:
+        self._predictions_made += 1
+        if meta.mahalanobis_di > self._abstain_di:
+            self._abstentions += 1
+            return meta.model_copy(update={"p_meta": 0.5, "epistemic_gate_passed": False, "expected_net_edge_bps": 0.0})
+        if self._residual is None:
+            return meta
+        p_adj = float(self._residual.adjust(meta.p_meta, np.asarray(x_row, dtype=np.float64).reshape(1, -1))[0])
+        return meta.model_copy(update={"p_meta": p_adj})
+
+    @property
+    def residual_telemetry(self) -> dict[str, Any]:
+        return {
+            "residual_layer": self._residual is not None,
+            "abstention_di_threshold": None if not math.isfinite(self._abstain_di) else self._abstain_di,
+            "predictions": self._predictions_made,
+            "abstentions": self._abstentions,
+            "abstention_rate": (self._abstentions / self._predictions_made) if self._predictions_made else 0.0,
+        }
 
     # ------------------------------------------------------------------ shadow mode (P5.1)
 
@@ -2084,6 +2136,7 @@ class ControlCenterStateStore:
                 sigma_bar=sigma_bar,
                 vpin=new_hawkes.vpin,
             )
+            new_meta = self._apply_residual_and_abstention(new_meta, x_cont_win[-1])
         else:
             new_meta = _neutral_meta_prediction(s.active_instrument, ts_close, self._last_retrain_message)
 

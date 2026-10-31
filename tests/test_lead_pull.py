@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from core.contracts import ExecutionAction
 from core.execution.defensive_maker import DefensiveMakerExecutionAlgorithm, should_pull_for_lead_move
-from research.quote_sim import QuoteSimConfig, simulate_quotes
+from research.quote_sim import QuoteSimConfig, load_recording, simulate_quotes
 
 
 def test_pull_rule_is_side_aware_and_scaled_by_spread() -> None:
@@ -76,3 +77,13 @@ def test_simulator_with_pull_cancels_before_the_toxic_print() -> None:
     assert res.pulls >= 1
     assert all(f.price != 100_000.0 for f in res.fills)  # the stale bid was gone when the seller arrived
     assert res.adverse_fills == 0
+
+
+def test_recorded_btc_slice_has_fewer_adverse_fills_with_lead_pull() -> None:
+    """P4.1 acceptance on real data: six minutes of recorded HL, Binance and Bybit BTC ticks (Oct 2026)."""
+    events = load_recording(Path(__file__).parent / "fixtures" / "btc_tick_recording_6min.jsonl.gz")
+    base = simulate_quotes(events, "BTC", QuoteSimConfig(lead_pull=False))
+    pulled = simulate_quotes(events, "BTC", QuoteSimConfig(lead_pull=True))
+    assert pulled.pulls > 0 and len(base.fills) > 100
+    assert pulled.adverse_fills < base.adverse_fills
+    assert pulled.adverse_rate < base.adverse_rate
