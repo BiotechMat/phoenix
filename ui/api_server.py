@@ -122,13 +122,51 @@ def _try_fetch_live_btc_price(fallback_price: float, rng: np.random.Generator) -
         with urllib.request.urlopen(req, timeout=0.6) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
             spot = float(payload["data"]["amount"])
-            # Add tiny microstructure noise if consecutive polls happen within same second
-            jitter = float(rng.normal(0.0, spot * 0.0004))
+            # Blend live Coinbase spot price with realistic 15m bar microstructure dispersion (~18 bps)
+            jitter = float(rng.normal(0.0, spot * 0.0018))
             return round(max(1000.0, spot + jitter), 2), "LIVE-EXCHANGE"
     except Exception:
         # Honest zero-drift stochastic market walk (can go UP or DOWN!)
-        ret = float(rng.normal(0.0001, 0.0038))
+        ret = float(rng.normal(0.0001, 0.0022))
         return round(max(1000.0, fallback_price * (1.0 + ret)), 2), "SIMULATED-FEED"
+
+
+def _reanchor_state_to_live_price(
+    state: DashboardTelemetryState, live_spot: float
+) -> DashboardTelemetryState:
+    """Scale initial warm-up bars & barriers so Bar #12 matches the current live BTC spot price."""
+    old_last_close = state.dollar_bars[-1].close
+    if old_last_close <= 0 or abs(live_spot - old_last_close) < 1.0:
+        return state
+    scale = live_spot / old_last_close
+    scaled_bars = [
+        b.model_copy(
+            update={
+                "open": round(b.open * scale, 2),
+                "high": round(b.high * scale, 2),
+                "low": round(b.low * scale, 2),
+                "close": round(b.close * scale, 2),
+                "mark_price": round(b.mark_price * scale, 2),
+                "spot_price": round(b.spot_price * scale, 2),
+            }
+        )
+        for b in state.dollar_bars
+    ]
+    scaled_barriers = [
+        lbl.model_copy(
+            update={
+                "upper_barrier": round(lbl.upper_barrier * scale, 2),
+                "lower_barrier": round(lbl.lower_barrier * scale, 2),
+            }
+        )
+        for lbl in state.barrier_labels
+    ]
+    return state.model_copy(
+        update={
+            "dollar_bars": scaled_bars,
+            "barrier_labels": scaled_barriers,
+        }
+    )
 
 
 class ControlCenterStateStore:
@@ -136,10 +174,14 @@ class ControlCenterStateStore:
 
     def __init__(self, initial_state: DashboardTelemetryState | None = None) -> None:
         self._starting_capital_usd: float = 100_000.0
-        self._state: DashboardTelemetryState = initial_state or build_default_dashboard_state()
+        self._rng: np.random.Generator = np.random.default_rng(20261031)
+        raw_state = initial_state or build_default_dashboard_state()
+        live_anchor, _ = _try_fetch_live_btc_price(raw_state.dollar_bars[-1].close, self._rng)
+        self._state: DashboardTelemetryState = (
+            raw_state if initial_state is not None else _reanchor_state_to_live_price(raw_state, live_anchor)
+        )
         self._tick_counter: int = len(self._state.dollar_bars)
         self._auto_running: bool = False  # Wait for user to click Start Dry-Run!
-        self._rng: np.random.Generator = np.random.default_rng(20261031)
         self._wins: int = 0
         self._losses: int = 0
 
@@ -279,6 +321,11 @@ class ControlCenterStateStore:
         self._state = base_state.model_copy(
             update={
                 "pnl_metrics": fresh_pnl,
+                "dollar_bars": self._state.dollar_bars,
+                "positioning_signals": self._state.positioning_signals,
+                "barrier_labels": self._state.barrier_labels,
+                "meta_predictions": self._state.meta_predictions,
+                "hawkes_history": self._state.hawkes_history,
                 "last_control_message": msg,
             }
         )
