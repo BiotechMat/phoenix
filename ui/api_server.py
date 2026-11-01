@@ -102,7 +102,7 @@ from core.models import (
     extract_continuous_and_binary_from_snapshots,
 )
 from research.decay_monitor import DecayReport, evaluate_decay
-from research.validation.shadow import PreRegisteredThresholds, ShadowBook
+from research.validation.shadow import PreRegisteredThresholds, ShadowBook, load_thresholds
 from risk.cascade_controls import (
     CascadeController,
     FragilityAssessment,
@@ -165,12 +165,16 @@ FEATURE_WINDOW_BARS: Final[int] = 4096
 UI_WINDOW_BARS: Final[int] = 16
 MIN_TRAIN_LABELLED_BARS: Final[int] = 500
 DEFAULT_META_EXTRA_FEATURES: Final[tuple[str, ...]] = ()
-# P2.3 features that passed P1.8 on two non-overlapping years; they run as a shadow challenger (P5.1) first.
-DEFAULT_META_CHALLENGER_FEATURES: Final[tuple[str, ...]] = ("momentum_1w", "mark_index_divergence_chg_1h", "nyse_open_flag")
+# P2.3 features that passed P1.8 (log-loss) on two non-overlapping years. A challenger meta-labeller with them can run
+# in the shadow book, but it is off by default: replayed along CPCV paths it loses at trade level
+# (research/meta_shadow_paths.py), so it does not meet the P5.1 entry condition.
+P23_CHALLENGER_FEATURES: Final[tuple[str, ...]] = ("momentum_1w", "mark_index_divergence_chg_1h", "nyse_open_flag")
+DEFAULT_META_CHALLENGER_FEATURES: Final[tuple[str, ...]] = ()
 SLEEVE_META_CHALLENGER: Final[str] = "meta_labeller_challenger"
 # Live feeds seed history with today's open interest copied onto every bar (no OI history endpoint), so the
 # OI features need this many live bars of real per-bar OI before they match training (48 = the z-score window).
 OI_WARMUP_BARS: Final[int] = 48
+SHADOW_THRESHOLDS_PATH: Final[Path] = Path(__file__).resolve().parent.parent / "data" / "shadow_thresholds.json"
 RETRAIN_INTERVAL_NS: Final[int] = 24 * 3_600 * 1_000_000_000
 DERIVATIVES_INPUT_TTL_NS: Final[int] = 5 * 60 * 1_000_000_000
 WAITING_LOG_INTERVAL_SEC: Final[float] = 60.0
@@ -455,7 +459,10 @@ class ControlCenterStateStore:
         # Shadow mode (P5.1): unvalidated or newly enabled sleeves trade here, never in the ledger.
         self._shadow_positions = PositionManager(fee_schedule=self._fee, barrier_config=self._barrier_cfg)
         self._shadow_books: dict[str, ShadowBook] = {}
-        self._shadow_thresholds: dict[str, PreRegisteredThresholds] = dict(shadow_thresholds or {})
+        # Pre-registered kill thresholds (P5.1): explicit argument, else the committed registration file.
+        self._shadow_thresholds: dict[str, PreRegisteredThresholds] = dict(
+            shadow_thresholds if shadow_thresholds is not None else load_thresholds(SHADOW_THRESHOLDS_PATH)
+        )
         self._latest_shadow_targets: dict[str, SleeveTarget] = {}
         # Decay monitor (P5.2)
         self._latest_decay: DecayReport | None = None
@@ -1836,7 +1843,8 @@ class ControlCenterStateStore:
             ch_expected = (ch.p_meta * ub - (1.0 - ch.p_meta) * lb) * 10_000.0 - self._impact_bps("BTC", hrp["BTC"], sigma_bar)
             ch_alloc = compute_signed_target_weights(
                 [AssetAllocationInput(asset_id="BTC", y_primary=ch.effective_direction, w_hrp=hrp["BTC"], p_meta=ch.p_meta,
-                                      expected_gross_return_bps=ch_expected, fee_schedule=self._fee, epistemic_gate_passed=ch.epistemic_gate_passed)],
+                                      expected_gross_return_bps=ch_expected, fee_schedule=self._fee, epistemic_gate_passed=ch.epistemic_gate_passed,
+                                      payoff_ratio=(ub / lb) if lb > 0 else None)],  # payoff-aware Kelly, tested in shadow only
                 regime_multiplier=directional_m,
                 max_gross_leverage=MAX_GROSS_LEVERAGE,
             )

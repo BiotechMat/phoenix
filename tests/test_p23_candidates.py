@@ -155,7 +155,7 @@ def test_challenger_is_fitted_and_trades_only_in_the_shadow_book(tmp_path: objec
 
     from core.contracts import DataAvailability
     from tests.phase0_helpers import build_store, companion_flat_bars, make_snapshot, ohlc_path
-    from ui.api_server import DEFAULT_META_CHALLENGER_FEATURES, MIN_TRAIN_LABELLED_BARS, SLEEVE_META_CHALLENGER
+    from ui.api_server import MIN_TRAIN_LABELLED_BARS, P23_CHALLENGER_FEATURES, SLEEVE_META_CHALLENGER
 
     history = sine_history("BTC", MIN_TRAIN_LABELLED_BARS + 800, 100.0)
     live = ohlc_path("BTC", [(100.0, 100.3, 99.7, 100.2), (100.2, 100.5, 99.9, 100.1)])
@@ -165,10 +165,11 @@ def test_challenger_is_fitted_and_trades_only_in_the_shadow_book(tmp_path: objec
         snapshots=[make_snapshot()],
         history={"BTC": history},
         availability=DataAvailability(candles=True, funding_history=True, open_interest_history=True, feed_source="SCRIPTED"),
+        meta_challenger_features=P23_CHALLENGER_FEATURES,
     )
     tele = store.residual_telemetry
     assert tele["meta_features"] == ["ffd_close_zscore", "ffd_oi_zscore", "oi_funding_basis_zscore"]  # live model unchanged
-    assert tele["challenger_features"] == list(DEFAULT_META_CHALLENGER_FEATURES) and tele["challenger_fitted"] is True
+    assert tele["challenger_features"] == list(P23_CHALLENGER_FEATURES) and tele["challenger_fitted"] is True
     assert SLEEVE_META_CHALLENGER in store.shadow_sleeve_ids
     store.step_simulation_tick()
     store.step_simulation_tick()
@@ -197,3 +198,16 @@ def test_live_feed_without_oi_history_holds_the_model_neutral_for_the_warmup(tmp
     assert meta.p_meta == 0.5 and meta.epistemic_gate_passed is False
     assert store.residual_telemetry["oi_warmup_remaining_bars"] == OI_WARMUP_BARS - 1
     assert store.residual_telemetry["challenger_p_meta"] is None
+
+
+def test_challenger_is_off_by_default(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from tests.phase0_helpers import build_store, companion_flat_bars, make_snapshot, ohlc_path
+    from ui.api_server import SLEEVE_META_CHALLENGER
+
+    store = build_store(
+        Path(str(tmp_path)), live_bars={"BTC": ohlc_path("BTC", [(100.0, 100.3, 99.7, 100.2)]), **companion_flat_bars(1)},
+        snapshots=[make_snapshot()], history={"BTC": sine_history("BTC", 200, 100.0)},
+    )
+    assert SLEEVE_META_CHALLENGER not in store.shadow_sleeve_ids and store.residual_telemetry["challenger_features"] == []

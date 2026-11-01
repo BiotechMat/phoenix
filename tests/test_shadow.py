@@ -74,7 +74,7 @@ def test_unvalidated_derivatives_sleeve_trades_in_the_shadow_book(tmp_path: Path
     shadow_closed = store.shadow_positions.closed_trades
     assert [t.exit_reason for t in shadow_closed] == [PositionExitReason.PROFIT_BARRIER, PositionExitReason.STOP_BARRIER, PositionExitReason.VERTICAL_EXPIRY]
     tele = store.shadow_telemetry
-    assert tele["sleeves"] == ["derivatives_alpha", "meta_labeller_challenger"]  # the P2.3 challenger also runs in shadow
+    assert tele["sleeves"] == ["derivatives_alpha"]  # the P2.3 challenger is off by default
     assert tele["status"]["derivatives_alpha"]["trades"] == 3 and tele["status"]["derivatives_alpha"]["state"] == "SHADOW"
 
 
@@ -93,3 +93,35 @@ def test_enabled_trend_sleeve_defaults_to_shadow(tmp_path: Path) -> None:
     assert f"{TREND_SLEEVE_ID}:BTC" not in store.position_manager.open_positions
     assert f"{TREND_SLEEVE_ID}:BTC" in store.shadow_positions.open_positions
     assert TREND_SLEEVE_ID in store.shadow_telemetry["sleeves"]
+
+
+def test_per_trade_basis_compares_like_with_like_and_thresholds_round_trip(tmp_path: Path) -> None:
+    from research.validation.shadow import load_thresholds, save_thresholds
+
+    # Per-trade Sharpe of this stream: mean 0.25 / sd ~0.8 ~ 0.31 per trade.
+    th = PreRegisteredThresholds(sleeve_id="trend", median_path_sharpe=1.0, min_live_sharpe=0.8, max_drawdown=0.5, n_paths=9, basis="per_trade")
+    book = ShadowBook("trend", th, min_trades=40, capital_usd=1000.0)
+    for i in range(40):
+        book.record(_trade(1.0 if i % 3 else -0.5, i), FeeSchedule.hyperliquid())
+    assert book.status().killed and "Sharpe" in (book.status().kill_reason or "")  # 0.31 per trade < 0.8 per trade
+    hourly = th.model_copy(update={"basis": "per_hour"})
+    book2 = ShadowBook("trend", hourly, min_trades=40, capital_usd=1000.0)
+    for i in range(40):
+        book2.record(_trade(1.0 if i % 3 else -0.5, i), FeeSchedule.hyperliquid())
+    assert not book2.status().killed  # 0.8 / sqrt(8760) per hour is a much lower bar
+    path = tmp_path / "th.json"
+    save_thresholds([th], path)
+    save_thresholds([hourly.model_copy(update={"sleeve_id": "other"})], path)
+    loaded = load_thresholds(path)
+    assert loaded["trend"] == th and loaded["other"].basis == "per_hour"
+    assert load_thresholds(tmp_path / "missing.json") == {}
+
+
+def test_path_replay_holds_each_trade_to_its_exit() -> None:
+    from research.meta_shadow_paths import replay_path
+
+    w = np.array([0.5, 0.5, 0.0, -0.2, 0.0, 0.3])
+    net = np.array([0.01, 0.02, 0.0, 0.03, 0.0, -0.01])
+    hold = np.array([2, 1, 1, 3, 1, 1])
+    out = replay_path(w, net, hold)
+    assert out.tolist() == pytest.approx([0.005, 0.2 * 0.03])  # bar 1 is inside the first trade; bar 5 inside the second

@@ -67,3 +67,19 @@ def test_store_reports_transfer_coefficient_and_deducts_impact(tmp_path: Path) -
     impact = store._impact_bps("BTC", 1 / 3, 0.002)
     expected = square_root_impact(0.002 * math.sqrt(96.0), (1 / 3) * 5000.0 * 0.5, 1_000_000.0) * 1e4
     assert impact == pytest.approx(expected) and impact > 0.0
+
+
+def test_payoff_aware_kelly_breaks_even_at_one_over_one_plus_b() -> None:
+    from core.contracts import AssetAllocationInput, FeeSchedule, compute_fractional_kelly, compute_signed_target_weights
+
+    assert compute_fractional_kelly(0.6) == pytest.approx(0.5 * 0.2)  # even odds unchanged
+    assert compute_fractional_kelly(0.4) == 0.0
+    b = 0.008 / 0.003  # 80 bp profit barrier against a 30 bp stop
+    assert compute_fractional_kelly(1.0 / (1.0 + b), payoff_ratio=b) == pytest.approx(0.0, abs=1e-12)
+    assert compute_fractional_kelly(0.4, payoff_ratio=b) == pytest.approx(0.5 * (0.4 - 0.6 / b))
+    with pytest.raises(ValueError):
+        compute_fractional_kelly(0.4, payoff_ratio=0.0)
+    fee = FeeSchedule.hyperliquid()
+    even = compute_signed_target_weights([AssetAllocationInput(asset_id="BTC", y_primary=1, w_hrp=1 / 3, p_meta=0.4, expected_gross_return_bps=12.0, fee_schedule=fee)], regime_multiplier=1.0)
+    payoff = compute_signed_target_weights([AssetAllocationInput(asset_id="BTC", y_primary=1, w_hrp=1 / 3, p_meta=0.4, expected_gross_return_bps=12.0, fee_schedule=fee, payoff_ratio=b)], regime_multiplier=1.0)
+    assert even.weights["BTC"] == 0.0 and payoff.weights["BTC"] == pytest.approx((1 / 3) * 0.5 * (0.4 - 0.6 / b))

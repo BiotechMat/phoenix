@@ -13,7 +13,9 @@ is eligible for promotion; promotion itself is a manual step.
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -34,6 +36,10 @@ class PreRegisteredThresholds(BaseModel):
     max_drawdown: float = Field(ge=0.0, description="Drawdown of the 5th-percentile CPCV path (as a positive fraction)")
     n_paths: int = Field(ge=1)
     registered_from: str = ""
+    basis: Literal["per_hour", "per_trade"] = Field(
+        default="per_hour",
+        description="per_hour: Sharpe annualised from hourly path returns; per_trade: Sharpe of per-trade returns (the shadow book's unit)",
+    )
 
 
 def _path_sharpe(r: NDArray[np.float64], periods_per_year: float) -> float:
@@ -131,7 +137,11 @@ class ShadowBook:
         if len(self._returns) >= self.min_trades:
             sd = float(np.std(r, ddof=1))
             per_trade_sharpe = float(np.mean(r) / sd) if sd > 0 else 0.0
-            path_per_trade = self.thresholds.min_live_sharpe / math.sqrt(HOURS_PER_YEAR)
+            path_per_trade = (
+                self.thresholds.min_live_sharpe
+                if self.thresholds.basis == "per_trade"
+                else self.thresholds.min_live_sharpe / math.sqrt(HOURS_PER_YEAR)
+            )
             if per_trade_sharpe < path_per_trade:
                 self._killed = f"Sharpe below 80% of the median CPCV path after {len(self._returns)} trades"
 
@@ -157,5 +167,21 @@ class ShadowBook:
         )
 
 
-__all__ = ["PreRegisteredThresholds", "ShadowBook", "ShadowReconciliation", "ShadowStatus", "register_thresholds"]
+def save_thresholds(items: list[PreRegisteredThresholds], path: Path) -> None:
+    """Merge thresholds into a JSON file keyed by sleeve id (the pre-registration record)."""
+    existing: dict[str, object] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    for th in items:
+        existing[th.sleeve_id] = th.model_dump(mode="json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_thresholds(path: Path) -> dict[str, PreRegisteredThresholds]:
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return {k: PreRegisteredThresholds(**v) for k, v in raw.items()}
+
+
+__all__ = ["PreRegisteredThresholds", "ShadowBook", "ShadowReconciliation", "ShadowStatus", "load_thresholds", "register_thresholds", "save_thresholds"]
 

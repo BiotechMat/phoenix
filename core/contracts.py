@@ -586,6 +586,7 @@ class AssetAllocationInput(BaseModel):
     expected_gross_return_bps: float
     fee_schedule: FeeSchedule = Field(default_factory=FeeSchedule.usdt_perp)
     epistemic_gate_passed: bool = True
+    payoff_ratio: float | None = Field(default=None, gt=0.0, description="Win/loss ratio for Kelly; None = even odds")
 
     @field_validator("y_primary")
     @classmethod
@@ -610,11 +611,21 @@ class PortfolioAllocationOutput(BaseModel):
     rejected_for_fees: list[str]
 
 
-def compute_fractional_kelly(p_meta: float, gamma_frac: float = 0.5) -> float:
-    """Compute f_Kelly(p_meta) = clip(gamma_frac * (2 * p_meta - 1), 0.0, 1.0)."""
-    if p_meta <= 0.5:
-        return 0.0
-    raw = gamma_frac * (2.0 * p_meta - 1.0)
+def compute_fractional_kelly(p_meta: float, gamma_frac: float = 0.5, payoff_ratio: float | None = None) -> float:
+    """Fractional Kelly fraction.
+
+    Without ``payoff_ratio`` (even odds): clip(gamma_frac * (2 * p_meta - 1), 0, 1), zero at or below p = 0.5.
+    With ``payoff_ratio`` b = win / loss (for example profit barrier / stop barrier):
+    clip(gamma_frac * (p - (1 - p) / b), 0, 1), positive above the breakeven p = 1 / (1 + b).
+    """
+    if payoff_ratio is None:
+        if p_meta <= 0.5:
+            return 0.0
+        raw = gamma_frac * (2.0 * p_meta - 1.0)
+    else:
+        if payoff_ratio <= 0.0:
+            raise ValueError(f"payoff_ratio must be positive, got {payoff_ratio}")
+        raw = gamma_frac * (p_meta - (1.0 - p_meta) / payoff_ratio)
     return float(min(max(raw, 0.0), 1.0))
 
 
@@ -663,7 +674,7 @@ def compute_signed_target_weights(
 
     for item in inputs:
         hrp_weights[item.asset_id] = item.w_hrp
-        f_kelly = compute_fractional_kelly(item.p_meta, gamma_frac=gamma_frac)
+        f_kelly = compute_fractional_kelly(item.p_meta, gamma_frac=gamma_frac, payoff_ratio=item.payoff_ratio)
         kelly_map[item.asset_id] = f_kelly
 
         min_fee_hurdle_bps = item.fee_schedule.roundtrip_maker_bps
