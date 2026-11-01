@@ -11,3 +11,4 @@ a stop are always decisions (charter section 5).
 | Id | Title | Date | Kind | Status |
 | --- | --- | --- | --- | --- |
 | [D-0001](D-0001-phoenix-has-an-executive-board.md) | Phoenix has an executive board modelled on a quantitative trading firm | 31 October 2026 | Governance | Decided |
+| [D-0002](D-0002-override-of-cco-stop-on-binance-archive-data.md) | Override of a stop: the CCO's stop on models trained on Binance archive data | 1 November 2026 | Override of a stop | Decided |

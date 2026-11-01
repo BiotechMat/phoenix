@@ -2,7 +2,7 @@
 
 - **Question as asked:** "have a first board meeting, discuss current platform and planned upgrades and profitability"
 - **Seats convened:** all seven (CIO, Head of Research, CRO, CTO, Head of Execution, CFO, CCO). The question is strategic: it covers the platform, the roadmap, the profitability test and the path to first live capital.
-- **Draft decision proposed:** D-0002, status Proposed. The CEO has not decided.
+- **Draft decision proposed:** the remediation programme below, status Proposed. The CEO has not decided. It was drafted as D-0002; that number was taken on 1 November 2026 by the Binance override, so the draft takes the next free number when decided.
 
 ## Question
 
@@ -164,7 +164,7 @@ The CFO, CRO, Head of Research and CTO carry the recommendation; the CIO, Head o
 
 ## Draft decision (proposed; not written to the register)
 
-> # D-0002: Paper-stage remediation before the paper record of record begins
+> # D-NNNN: Paper-stage remediation before the paper record of record begins
 >
 > - **Date:** 31 October 2026
 > - **Decided by:** CEO
