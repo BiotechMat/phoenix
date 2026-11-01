@@ -175,3 +175,25 @@ def test_challenger_is_fitted_and_trades_only_in_the_shadow_book(tmp_path: objec
     assert store.residual_telemetry["challenger_p_meta"] is not None
     assert all(p.sleeve_id != SLEEVE_META_CHALLENGER for p in store.position_manager.open_positions.values())
     assert all(t.sleeve_id != SLEEVE_META_CHALLENGER for t in store.position_manager.closed_trades)
+
+
+def test_live_feed_without_oi_history_holds_the_model_neutral_for_the_warmup(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from core.contracts import DataAvailability
+    from tests.phase0_helpers import build_store, companion_flat_bars, make_snapshot, ohlc_path
+    from ui.api_server import MIN_TRAIN_LABELLED_BARS, OI_WARMUP_BARS
+
+    history = sine_history("BTC", MIN_TRAIN_LABELLED_BARS + 400, 100.0)
+    live = ohlc_path("BTC", [(100.0, 100.3, 99.7, 100.2)] * 3)
+    avail = DataAvailability(candles=True, funding_history=True, open_interest_history=False, feed_source="HYPERLIQUID-L1")
+    store = build_store(
+        Path(str(tmp_path)), live_bars={"BTC": live, **companion_flat_bars(3)}, snapshots=[make_snapshot()],
+        history={"BTC": history}, availability=avail,
+    )
+    assert store.residual_telemetry["oi_warmup_remaining_bars"] == OI_WARMUP_BARS
+    store.step_simulation_tick()
+    meta = store.state.meta_predictions[-1]
+    assert meta.p_meta == 0.5 and meta.epistemic_gate_passed is False
+    assert store.residual_telemetry["oi_warmup_remaining_bars"] == OI_WARMUP_BARS - 1
+    assert store.residual_telemetry["challenger_p_meta"] is None

@@ -168,6 +168,9 @@ DEFAULT_META_EXTRA_FEATURES: Final[tuple[str, ...]] = ()
 # P2.3 features that passed P1.8 on two non-overlapping years; they run as a shadow challenger (P5.1) first.
 DEFAULT_META_CHALLENGER_FEATURES: Final[tuple[str, ...]] = ("momentum_1w", "mark_index_divergence_chg_1h", "nyse_open_flag")
 SLEEVE_META_CHALLENGER: Final[str] = "meta_labeller_challenger"
+# Live feeds seed history with today's open interest copied onto every bar (no OI history endpoint), so the
+# OI features need this many live bars of real per-bar OI before they match training (48 = the z-score window).
+OI_WARMUP_BARS: Final[int] = 48
 RETRAIN_INTERVAL_NS: Final[int] = 24 * 3_600 * 1_000_000_000
 DERIVATIVES_INPUT_TTL_NS: Final[int] = 5 * 60 * 1_000_000_000
 WAITING_LOG_INTERVAL_SEC: Final[float] = 60.0
@@ -443,6 +446,7 @@ class ControlCenterStateStore:
         )
         bar_feature_matrix([], self._meta_extra_features + self._meta_challenger_features)  # fail fast on a name that needs more than bars
         self._challenger_worker: LightGBMMetaLabelWorker | None = None
+        self._oi_warmup_remaining: int = 0
         self._latest_challenger_meta: MetaPredictionOutput | None = None
         self._latest_fragility: dict[str, FragilityAssessment] = {}
         self._collateral_haircut: float = 0.0
@@ -510,6 +514,8 @@ class ControlCenterStateStore:
             seeded, avail = self._feed.seed_bars("BTC", seed_bars)
             self._history_bars = list(seeded)
             self._data_availability = avail
+            if seeded and not avail.open_interest_history and avail.feed_source != "SCRIPTED":
+                self._oi_warmup_remaining = OI_WARMUP_BARS
             if seeded and avail.open_interest_history:
                 _persist_bars_to_parquet(
                     seeded,
@@ -1380,6 +1386,7 @@ class ControlCenterStateStore:
             "meta_features": self.meta_feature_names,
             "challenger_features": list(self._meta_challenger_features),
             "challenger_fitted": self._challenger_worker is not None,
+            "oi_warmup_remaining_bars": self._oi_warmup_remaining,
             "challenger_p_meta": None if self._latest_challenger_meta is None else self._latest_challenger_meta.p_meta,
         }
 
@@ -2209,7 +2216,14 @@ class ControlCenterStateStore:
             toxic_sweep_active=bool(vpin_val > 0.60 or hawkes_snap.branching_ratio_eta > 0.70),
         )
 
-        if self._ml_worker is not None and features_ok:
+        if self._oi_warmup_remaining > 0 and new_bar.open_interest > 0.0:
+            self._oi_warmup_remaining -= 1
+        if self._oi_warmup_remaining > 0:
+            new_meta = _neutral_meta_prediction(
+                s.active_instrument, ts_close, f"open-interest features warming up: {OI_WARMUP_BARS - self._oi_warmup_remaining}/{OI_WARMUP_BARS} live bars"
+            )
+            self._latest_challenger_meta = None
+        elif self._ml_worker is not None and features_ok:
             new_meta = self._ml_worker.predict_single(
                 instrument_id=s.active_instrument,
                 ts_close_ns=ts_close,
@@ -2418,7 +2432,7 @@ class ControlCenterStateStore:
         if not why_parts:
             why_parts.append(
                 f"No entry: BTC meta-labeller p_meta={new_meta.p_meta:.1%} direction={new_meta.effective_direction:+d} "
-                f"({'gate open' if new_meta.epistemic_gate_passed else 'gate closed or no model'}); "
+                f"({'gate open' if new_meta.epistemic_gate_passed else ('open-interest warm-up, ' + str(self._oi_warmup_remaining) + ' bars left' if self._oi_warmup_remaining > 0 else 'gate closed or no model')}); "
                 f"derivatives directions {[sig.primary_direction for sig in self._latest_derivatives_signals.values()]}; "
                 f"carry actionable {[ev.is_actionable for ev in self._latest_carry_evaluations.values()]}; "
                 f"regime M={m_regime:.2f}{' (veto)' if regime_veto else ''}; {n_open} position(s) held."
